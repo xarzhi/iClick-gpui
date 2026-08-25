@@ -13,3 +13,11 @@ anyhow = "1.0"
 
 [build-dependencies]
 winres = "0.1"
+
+
+[profile.release]
+opt-level = "z"          # 最优大小
+lto = true               # 链接时优化，删死代码
+codegen-units = 1        # 单代码生成单元，更好优化
+strip = true             # 去掉调试符号（最大头！）
+panic = "abort"          # 去掉 panic unwinding 栈信息
