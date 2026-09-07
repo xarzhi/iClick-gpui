@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -7,6 +7,7 @@ use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::group_box::GroupBox;
 use gpui_component::input::{Input, InputState};
+use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::select::{SearchableVec, Select, SelectItem, SelectState};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
@@ -19,6 +20,11 @@ pub struct IClick {
     active_tab: usize,
     tabs: Vec<String>,
     always_on_top: bool,
+    front_opt: bool,
+    opt_cate: Option<usize>,
+    fuzzy_click: bool,
+    hide_when_choose: bool,
+    watch_hotkey: bool,
     loop_count_input: Entity<InputState>,
     fuzzy_click_input: Entity<InputState>,
     data_table: Entity<TableState<MyTableDelegate>>,
@@ -278,6 +284,7 @@ impl Render for IClick {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .text_xs()
             .child(
                 TabBar::new("tabs")
                     .small()
@@ -317,11 +324,15 @@ impl Render for IClick {
                                             .child(
                                                 div()
                                                     .w_full()
+                                                    .text_xs()
                                                     .flex_1()
                                                     .h(px(100.0))
                                                     .border(px(1.0))
                                                     .border_color(cx.theme().border)
                                                     .p(px(5.))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .justify_between()
                                                     .child(
                                                         div()
                                                             .border(px(1.0))
@@ -334,6 +345,39 @@ impl Render for IClick {
                                                                     .size_full()
                                                                     .text_color(rgb(0x1f44fa)),
                                                             ),
+                                                    )
+                                                    .child(
+                                                        div().child(
+                                                            RadioGroup::horizontal(
+                                                                "horizontal-group",
+                                                            )
+                                                            .text_xs()
+                                                            .children(["鼠标事件", "键盘事件"])
+                                                            .selected_index(self.opt_cate)
+                                                            .on_click(cx.listener(
+                                                                |view, index, _, cx| {
+                                                                    view.opt_cate = Some(*index);
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        div().child(
+                                                            Checkbox::new("hide")
+                                                                .label("选择时隐藏本窗口")
+                                                                .checked(self.hide_when_choose)
+                                                                .on_click({
+                                                                    let view = cx.entity().clone();
+                                                                    move |_, _window, cx| {
+                                                                        view.update(cx, |this, cx| {
+                                                                        this.hide_when_choose =
+                                                                            !this.hide_when_choose;
+                                                                        cx.notify();
+                                                                    });
+                                                                    }
+                                                                }),
+                                                        ),
                                                     ),
                                             ),
                                     )
@@ -349,7 +393,54 @@ impl Render for IClick {
                                                     .w_full()
                                                     .h(px(80.0))
                                                     .border(px(1.0))
-                                                    .border_color(cx.theme().border),
+                                                    .border_color(cx.theme().border)
+                                                    .flex()
+                                                    .p_1()
+                                                    .flex_col()
+                                                    .justify_between()
+                                                    .child(
+                                                        Checkbox::new("front_check")
+                                                            .label("监听热键")
+                                                            .checked(self.watch_hotkey)
+                                                            .on_click({
+                                                                let view = cx.entity().clone();
+                                                                move |_, _window, cx| {
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.watch_hotkey =
+                                                                            !this.watch_hotkey;
+                                                                        cx.notify();
+                                                                    });
+                                                                }
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .mr_10()
+                                                                    .child("鼠标事件快捷键"),
+                                                            )
+                                                            .child(
+                                                                Input::new(&self.fuzzy_click_input)
+                                                                    .small(),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .mr_10()
+                                                                    .child("键盘事件快捷键"),
+                                                            )
+                                                            .child(
+                                                                Input::new(&self.fuzzy_click_input)
+                                                                    .small(),
+                                                            ),
+                                                    ),
                                             ),
                                     ),
                             )
@@ -373,16 +464,16 @@ impl Render for IClick {
                                                 div()
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
                                                     .cursor(CursorStyle::PointingHand)
                                                     .child(
-                                                        div()
-                                                            .mr(px(10.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .child("窗口置顶"),
-                                                    )
-                                                    .child(
-                                                        Checkbox::new("always_on_top")
+														div()
+                										.flex()
+                        								.items_center()
+														.child(
+															div().text_xs().mr(px(10.)).child("窗口置顶：")
+														).child(
+														   Checkbox::new("always_on_top")
                                                             .label("")
                                                             .checked(self.always_on_top)
                                                             .on_click({
@@ -417,75 +508,208 @@ impl Render for IClick {
                                                                     });
                                                                 }
                                                             }),
+														)
+                                                     
+                                                    )
+                                                    .child(
+                                                        Button::new("start_pause")
+                                                            .label("开始")
+                                                            .w(px(140.0))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_click({
+                                                                let data_table =
+                                                                    self.data_table.clone();
+                                                                move |_, window, cx| {
+                                                                    data_table.update(
+                                                                        cx,
+                                                                        |state, cx| {
+                                                                            state
+                                                                                .delegate_mut()
+                                                                                .add_row(
+                                                                                    window, cx,
+                                                                                );
+                                                                        },
+                                                                    );
+                                                                }
+                                                            }),
                                                     ),
                                             )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .flex()
+                                                    .justify_between()
                                                     .child(
-                                                        div()
-                                                            .mr(px(10.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .child("前台操作"),
-                                                    )
-                                                    .child(
-                                                        Checkbox::new("front_check")
+														div()
+                										.flex()
+                        								.items_center()
+														.child(
+															div().mr(px(10.)).text_xs().child("前台操作：")
+														).child( Checkbox::new("front_check")
                                                             .label("")
-                                                            .checked(false),
+                                                            .checked(self.front_opt)
+                                                            .on_click({
+                                                                let view = cx.entity().clone();
+                                                                move |_, _window, cx| {
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.front_opt =
+                                                                            !this.front_opt;
+                                                                        cx.notify();
+                                                                    });
+                                                                }
+                                                            }),)
+                                                       
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .justify_between()
+                                                            .w(px(140.0))
+                                                            .child(
+                                                                Button::new("read_btn")
+                                                                    .label("读取")
+                                                                    .small()
+                                                                    .mr(px(10.0))
+                                                                    .cursor(
+                                                                        CursorStyle::PointingHand,
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                Button::new("save_btn")
+                                                                    .label("保存")
+                                                                    .small()
+                                                                    .cursor(
+                                                                        CursorStyle::PointingHand,
+                                                                    ),
+                                                            ),
                                                     ),
                                             )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
                                                     .child(
                                                         div()
-                                                            .mr(px(10.0))
                                                             .flex()
                                                             .items_center()
-                                                            .child("循环次数"),
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.0))
+                                                                    .child("循环次数"),
+                                                            )
+                                                            .child(div().w(px(80.0)).child(
+                                                                Input::new(&self.loop_count_input),
+                                                            )),
                                                     )
                                                     .child(
-                                                        div().w(px(80.0)).child(Input::new(
-                                                            &self.loop_count_input,
-                                                        )),
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("开始录制"),
+                                                            )
+                                                            .child(
+                                                                div().w(px(80.0)).child(
+                                                                    Input::new(
+                                                                        &self.fuzzy_click_input,
+                                                                    )
+                                                                    .suffix(div().child("px")),
+                                                                ),
+                                                            ),
                                                     ),
                                             )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
+                                                    .cursor(CursorStyle::PointingHand)
                                                     .child(
-                                                        div()
-                                                            .mr(px(10.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .child("模糊点击"),
-                                                    )
-                                                    .child(
-                                                        Checkbox::new("terms")
+														div()
+                .flex()
+                .items_center()
+														.child(
+															div().mr(px(10.)).text_xs().child("模糊点击：")
+														).child(  Checkbox::new("fuzzy_click")
                                                             .label("")
-                                                            .checked(false),
+                                                            .checked(self.fuzzy_click)
+                                                            .on_click({
+                                                                let view = cx.entity().clone();
+                                                                move |_, _window, cx| {
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.fuzzy_click =
+                                                                            !this.fuzzy_click;
+                                                                        cx.notify();
+                                                                    });
+                                                                }
+                                                            }))
+                                                      
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("模糊范围"),
+                                                            )
+                                                            .child(
+                                                                div().w(px(80.0)).child(
+                                                                    Input::new(
+                                                                        &self.fuzzy_click_input,
+                                                                    )
+                                                                    .suffix(div().child("px")),
+                                                                ),
+                                                            ),
                                                     ),
                                             )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
                                                     .child(
                                                         div()
-                                                            .mr(px(10.0))
                                                             .flex()
                                                             .items_center()
-                                                            .child("操作间隔"),
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.0))
+                                                                    .child("操作间隔"),
+                                                            )
+                                                            .child(div().w(px(80.0)).child(
+                                                                Input::new(&self.loop_count_input),
+                                                            )),
                                                     )
                                                     .child(
-                                                        div().w(px(80.0)).child(
-                                                            Input::new(&self.fuzzy_click_input)
-                                                                .suffix(div().child("ms")),
-                                                        ),
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("循环间隔"),
+                                                            )
+                                                            .child(
+                                                                div().w(px(80.0)).child(
+                                                                    Input::new(
+                                                                        &self.fuzzy_click_input,
+                                                                    )
+                                                                    .suffix(div().child("ms")),
+                                                                ),
+                                                            ),
                                                     ),
                                             )
                                             .child(
@@ -503,105 +727,6 @@ impl Render for IClick {
                                                         Checkbox::new("terms")
                                                             .label("")
                                                             .checked(false),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .h_full()
-                                            .text_size(px(14.0))
-                                            .flex()
-                                            .flex_col()
-                                            .justify_between()
-                                            .items_end()
-                                            .child(
-                                                Button::new("start_pause")
-                                                    .label("开始")
-                                                    .w(px(140.0))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_click({
-                                                        let data_table = self.data_table.clone();
-                                                        move |_, window, cx| {
-                                                            data_table.update(cx, |state, cx| {
-                                                                state
-                                                                    .delegate_mut()
-                                                                    .add_row(window, cx);
-                                                            });
-                                                        }
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .justify_between()
-                                                    .w(px(140.0))
-                                                    .child(
-                                                        Button::new("read_btn")
-                                                            .label("读取")
-                                                            .small()
-                                                            .mr(px(10.0))
-                                                            .cursor(CursorStyle::PointingHand),
-                                                    )
-                                                    .child(
-                                                        Button::new("save_btn")
-                                                            .label("保存")
-                                                            .small()
-                                                            .cursor(CursorStyle::PointingHand),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .child(
-                                                        div()
-                                                            .mr(px(10.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .child("开始录制"),
-                                                    )
-                                                    .child(
-                                                        div().w(px(80.0)).child(
-                                                            Input::new(&self.fuzzy_click_input)
-                                                                .suffix(div().child("px")),
-                                                        ),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .child(
-                                                        div()
-                                                            .mr(px(10.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .child("模糊范围"),
-                                                    )
-                                                    .child(
-                                                        div().w(px(80.0)).child(
-                                                            Input::new(&self.fuzzy_click_input)
-                                                                .suffix(div().child("px")),
-                                                        ),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .child(
-                                                        div()
-                                                            .mr(px(10.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .child("循环间隔"),
-                                                    )
-                                                    .child(
-                                                        div().w(px(80.0)).child(
-                                                            Input::new(&self.fuzzy_click_input)
-                                                                .suffix(div().child("ms")),
-                                                        ),
                                                     ),
                                             ),
                                     ),
@@ -648,7 +773,6 @@ fn main() {
                         ..WindowOptions::default()
                     },
                     |window, cx| {
-
                         let loop_count_input = cx.new(|cx| InputState::new(window, cx));
                         let fuzzy_click_input = cx.new(|cx| InputState::new(window, cx));
                         let delegate = MyTableDelegate::new(window, cx);
@@ -665,6 +789,11 @@ fn main() {
                             fuzzy_click_input,
                             data_table: state,
                             always_on_top: false,
+                            front_opt: false,
+                            fuzzy_click: false,
+                            opt_cate: Some(0),
+                            hide_when_choose: true,
+                            watch_hotkey: false,
                         });
                         cx.new(|cx| Root::new(view, window, cx))
                     },
