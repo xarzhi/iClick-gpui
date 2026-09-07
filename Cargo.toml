@@ -14,9 +14,12 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+regex = "1"
+
+
+
 [build-dependencies]
 winres = "0.1"
-
 
 [profile.release]
 opt-level = "z"          # 最优大小

@@ -2899,6 +2899,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "rdev",
+ "regex",
  "windows 0.58.0",
  "winres",
 ]
