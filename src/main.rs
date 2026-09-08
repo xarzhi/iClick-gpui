@@ -15,13 +15,28 @@ use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use gpui_component::{Icon, IconName};
-use rdev::{Event, EventType, listen};
+use rdev::{Button as RdevButton, Event, EventType, listen};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::vec;
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, WindowFromPoint};
+use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL, SPI_SETCURSORS,
+    SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SetSystemCursor, ShowWindow, SystemParametersInfoW,
+    WindowFromPoint,
+};
 
+fn set_selection_cursor(crosshair: bool) {
+    unsafe {
+        if crosshair {
+            if let Ok(cursor) = LoadCursorW(None, IDC_CROSS) {
+                let _ = SetSystemCursor(cursor, OCR_NORMAL);
+            }
+        } else {
+            let _ = SystemParametersInfoW(SPI_SETCURSORS, 0, None, SPIF_SENDCHANGE);
+        }
+    }
+}
 fn window_info_at(x: f64, y: f64) -> (String, String) {
     let point = POINT {
         x: x.round() as i32,
@@ -54,6 +69,7 @@ pub struct IClick {
     watch_hotkey: bool,
     is_choosing: bool,
     choosing_flag: Arc<AtomicBool>,
+    hidden_window: Arc<std::sync::Mutex<Option<HWND>>>,
     x_input: Entity<InputState>,
     y_input: Entity<InputState>,
     win_hwnd_input: Entity<InputState>,
@@ -517,10 +533,34 @@ impl TableDelegate for MyTableDelegate {
     }
 }
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
 };
 
 impl IClick {
+    fn hide_for_selection(&mut self) {
+        set_selection_cursor(true);
+        if !self.hide_when_choose {
+            return;
+        }
+
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if !hwnd.0.is_null() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                *self.hidden_window.lock().unwrap() = Some(hwnd);
+            }
+        }
+    }
+
+    fn show_after_selection(&mut self) {
+        set_selection_cursor(false);
+        if let Some(hwnd) = self.hidden_window.lock().unwrap().take() {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
+        }
+    }
+
     fn finish_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_choosing {
             return;
@@ -528,6 +568,7 @@ impl IClick {
 
         self.is_choosing = false;
         self.choosing_flag.store(false, Ordering::Release);
+        self.show_after_selection();
 
         let x = self.x_input.read(cx).value().parse::<usize>().unwrap_or(0);
         let y = self.y_input.read(cx).value().parse::<usize>().unwrap_or(0);
@@ -628,6 +669,7 @@ impl Render for IClick {
                                                                         cx.listener(|view, _, _, cx| {
                                                                             view.is_choosing = true;
                                                                             view.choosing_flag.store(true, Ordering::Release);
+                                                                            view.hide_for_selection();
                                                                             cx.notify();
                                                                         }),
                                                                     )
@@ -1273,13 +1315,14 @@ fn main() {
                             watch_hotkey: false,
                             is_choosing: false,
                             choosing_flag: choosing_flag.clone(),
+                            hidden_window: Arc::new(std::sync::Mutex::new(None)),
                             x_input,
                             y_input,
                             win_hwnd_input,
                             win_title_input,
                         });
                         let (mouse_tx, mouse_rx) =
-                            async_channel::unbounded::<(f64, f64, String, String)>();
+                            async_channel::unbounded::<(f64, f64, String, String, bool)>();
                         let listener_flag = choosing_flag.clone();
                         std::thread::spawn(move || {
                             let callback = move |event: Event| {
@@ -1287,7 +1330,19 @@ fn main() {
                                     && let EventType::MouseMove { x, y } = event.event_type
                                 {
                                     let (hwnd, title) = window_info_at(x, y);
-                                    let _ = mouse_tx.try_send((x, y, hwnd, title));
+                                    let _ = mouse_tx.try_send((x, y, hwnd, title, false));
+                                } else if listener_flag.load(Ordering::Acquire)
+                                    && let EventType::ButtonRelease(RdevButton::Left) =
+                                        event.event_type
+                                {
+                                    set_selection_cursor(false);
+                                    let _ = mouse_tx.try_send((
+                                        0.0,
+                                        0.0,
+                                        String::new(),
+                                        String::new(),
+                                        true,
+                                    ));
                                 }
                             };
                             if let Err(error) = listen(callback) {
@@ -1298,10 +1353,15 @@ fn main() {
                         let mouse_view = view.clone();
                         window
                             .spawn(cx, async move |window_cx| {
-                                while let Ok((x, y, hwnd, title)) = mouse_rx.recv().await {
+                                while let Ok((x, y, hwnd, title, released)) = mouse_rx.recv().await
+                                {
                                     let _ = window_cx.update(|window, cx| {
                                         mouse_view.update(cx, |view, cx| {
                                             if view.is_choosing {
+                                                if released {
+                                                    view.finish_selection(window, cx);
+                                                    return;
+                                                }
                                                 view.x_input.update(cx, |input, cx| {
                                                     input.set_value(&x.to_string(), window, cx);
                                                 });
