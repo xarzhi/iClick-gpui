@@ -208,33 +208,6 @@ impl MyTableDelegate {
         let execute_time_subscriptions: Vec<Subscription> = vec![];
         let opt_cate_subscriptions: Vec<Subscription> = vec![];
         let opt_type_subscriptions: Vec<Subscription> = vec![];
-        // let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
-        // for i in 0..3 {
-        //     data.push(MyData {
-        //         x: i + 1,
-        //         y: i + 1,
-        //         opt_cate: OptCate::鼠标,
-        //         opt_type: "左键单击".to_string(),
-        //         win_title: Some("chrome".to_string()),
-        //         delay: 1,
-        //         execute_time: 1,
-        //     });
-
-        //     execute_time_inputs.push(cx.new(|cx| {
-        //         let mut state = InputState::new(window, cx);
-        //         state.set_value("", window, cx);
-        //         state
-        //     }));
-
-        //     opt_cate_selects.push(cx.new(|cx| {
-        //         SelectState::new(
-        //             options.clone(), // 👈 SearchableVec<OptCate>
-        //             Some(IndexPath::default()),
-        //             window,
-        //             cx,
-        //         )
-        //     }));
-        // }
 
         Self {
             data,
