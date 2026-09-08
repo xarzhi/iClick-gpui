@@ -18,6 +18,29 @@ use gpui_component::{Icon, IconName};
 use rdev::{Event, EventType, listen};
 use std::sync::LazyLock;
 use std::vec;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, WindowFromPoint};
+
+fn window_info_at(x: f64, y: f64) -> (String, String) {
+    let point = POINT {
+        x: x.round() as i32,
+        y: y.round() as i32,
+    };
+
+    unsafe {
+        let hwnd = WindowFromPoint(point);
+        if hwnd.0.is_null() {
+            return (String::new(), String::new());
+        }
+
+        let handle = format!("0x{:X}", hwnd.0 as usize);
+        let mut title_buffer = vec![0u16; 512];
+        let title_length = GetWindowTextW(hwnd, &mut title_buffer);
+        let title = String::from_utf16_lossy(&title_buffer[..title_length as usize]);
+
+        (handle, title)
+    }
+}
 
 pub struct IClick {
     active_tab: usize,
@@ -219,21 +242,13 @@ impl MyTableDelegate {
         &self.data[row_ix].opt_cate
     }
 
-    fn add_row(&mut self, window: &mut Window, cx: &mut Context<TableState<Self>>) {
+    fn add_row(&mut self, window: &mut Window, cx: &mut Context<TableState<Self>>, data: MyData) {
         let new_row_ix = self.data.len();
-        self.data.push(MyData {
-            x: new_row_ix + 1,
-            y: new_row_ix + 1,
-            opt_cate: OptCate::鼠标,
-            opt_type: "左键单击".to_string(),
-            win_title: Some("chrome".to_string()),
-            delay: 1,
-            execute_time: 1,
-        });
+        self.data.push(data.clone());
 
         let delay_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx).pattern(Regex::new(r"^[0-9]\d*$").unwrap());
-            state.set_value("1", window, cx);
+            state.set_value(&data.delay.to_string(), window, cx);
             state
         });
         self.delay_inputs.push(delay_input.clone());
@@ -258,7 +273,7 @@ impl MyTableDelegate {
 
         let execute_time_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx).pattern(Regex::new(r"^[0-9]\d*$").unwrap());
-            state.set_value("1", window, cx);
+            state.set_value(&data.execute_time.to_string(), window, cx);
             state
         });
         self.execute_time_inputs.push(execute_time_input.clone());
@@ -283,7 +298,7 @@ impl MyTableDelegate {
 
         let opt_type_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx);
-            state.set_value("", window, cx);
+            state.set_value(&data.opt_type, window, cx);
             state
         });
         self.opt_type_inputs.push(opt_type_input.clone());
@@ -308,7 +323,12 @@ impl MyTableDelegate {
         // 给新行创建 Select —— 用传进来的 window
         let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
 
-        let select = cx.new(|cx| SelectState::new(options, Some(IndexPath::default()), window, cx));
+        let opt_cate_index = match data.opt_cate {
+            OptCate::鼠标 => 0,
+            OptCate::键盘 => 1,
+        };
+        let select = cx
+            .new(|cx| SelectState::new(options, Some(IndexPath::new(opt_cate_index)), window, cx));
 
         self.opt_cate_selects.push(select);
 
@@ -481,6 +501,44 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
 };
 
+impl IClick {
+    fn finish_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_choosing {
+            return;
+        }
+
+        self.is_choosing = false;
+
+        let x = self.x_input.read(cx).value().parse::<usize>().unwrap_or(0);
+        let y = self.y_input.read(cx).value().parse::<usize>().unwrap_or(0);
+        let win_title = self.win_title_input.read(cx).value().to_string();
+        let opt_cate = if self.opt_cate == Some(1) {
+            OptCate::键盘
+        } else {
+            OptCate::鼠标
+        };
+        let opt_type = match opt_cate {
+            OptCate::鼠标 => "左键单击".to_string(),
+            OptCate::键盘 => String::new(),
+        };
+
+        let data = MyData {
+            x,
+            y,
+            opt_cate,
+            opt_type,
+            win_title: Some(win_title),
+            delay: 0,
+            execute_time: 1,
+        };
+
+        self.data_table.update(cx, |table, cx| {
+            table.delegate_mut().add_row(window, cx, data);
+        });
+        cx.notify();
+    }
+}
+
 impl Render for IClick {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -554,16 +612,14 @@ impl Render for IClick {
                                                                     )
                                                                     .on_mouse_up(
                                                                         MouseButton::Left,
-                                                                        cx.listener(|view, _, _, cx| {
-                                                                            view.is_choosing = false;
-                                                                            cx.notify();
+                                                                        cx.listener(|view, _, window, cx| {
+                                                                            view.finish_selection(window, cx);
                                                                         }),
                                                                     )
                                                                     .on_mouse_up_out(
                                                                         MouseButton::Left,
-                                                                        cx.listener(|view, _, _, cx| {
-                                                                            view.is_choosing = false;
-                                                                            cx.notify();
+                                                                        cx.listener(|view, _, window, cx| {
+                                                                            view.finish_selection(window, cx);
                                                                         }),
                                                                     )
                                                                     .child(
@@ -766,11 +822,21 @@ impl Render for IClick {
 															 	data_table.update(
                                                                         cx,
                                                                         |state, cx| {
-                                                                            state
-                                                                                .delegate_mut()
-                                                                                .add_row(
-                                                                                    window, cx,
-                                                                                );
+                                                                            let delegate = state.delegate_mut();
+                                                                            let row_index = delegate.data.len();
+                                                                            delegate.add_row(
+                                                                                window,
+                                                                                cx,
+                                                                                MyData {
+                                                                                    x: row_index + 1,
+                                                                                    y: row_index + 1,
+                                                                                    opt_cate: OptCate::鼠标,
+                                                                                    opt_type: "左键单击".to_string(),
+                                                                                    win_title: Some("chrome".to_string()),
+                                                                                    delay: 1,
+                                                                                    execute_time: 1,
+                                                                                },
+                                                                            );
                                                                         },
                                                                     );
                                                                 }
@@ -1178,11 +1244,13 @@ fn main() {
                             win_hwnd_input,
                             win_title_input,
                         });
-                        let (mouse_tx, mouse_rx) = async_channel::unbounded::<(f64, f64)>();
+                        let (mouse_tx, mouse_rx) =
+                            async_channel::unbounded::<(f64, f64, String, String)>();
                         std::thread::spawn(move || {
                             let callback = move |event: Event| {
                                 if let EventType::MouseMove { x, y } = event.event_type {
-                                    let _ = mouse_tx.try_send((x, y));
+                                    let (hwnd, title) = window_info_at(x, y);
+                                    let _ = mouse_tx.try_send((x, y, hwnd, title));
                                 }
                             };
                             if let Err(error) = listen(callback) {
@@ -1193,7 +1261,7 @@ fn main() {
                         let mouse_view = view.clone();
                         window
                             .spawn(cx, async move |window_cx| {
-                                while let Ok((x, y)) = mouse_rx.recv().await {
+                                while let Ok((x, y, hwnd, title)) = mouse_rx.recv().await {
                                     let _ = window_cx.update(|window, cx| {
                                         mouse_view.update(cx, |view, cx| {
                                             if view.is_choosing {
@@ -1202,6 +1270,12 @@ fn main() {
                                                 });
                                                 view.y_input.update(cx, |input, cx| {
                                                     input.set_value(&y.to_string(), window, cx);
+                                                });
+                                                view.win_hwnd_input.update(cx, |input, cx| {
+                                                    input.set_value(&hwnd, window, cx);
+                                                });
+                                                view.win_title_input.update(cx, |input, cx| {
+                                                    input.set_value(&title, window, cx);
                                                 });
                                                 cx.notify();
                                             }
