@@ -8,7 +8,7 @@ use gpui_component::checkbox::Checkbox;
 use gpui_component::group_box::GroupBox;
 use gpui_component::input::{Input, InputState};
 use gpui_component::radio::{RadioGroup};
-use gpui_component::select::{SearchableVec, Select, SelectItem, SelectState};
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::*;
@@ -41,12 +41,12 @@ pub enum OptCate {
 }
 #[derive(Clone, Debug)]
 pub enum MouseOptType {
-    左键单机,
+    左键单击,
     左键双击,
     滚轮上滑,
     滚轮下滑,
-    滚轮单机,
-    右键单机,
+    滚轮单击,
+    右键单击,
     右键双击,
 }
 impl SelectItem for MouseOptType {
@@ -54,19 +54,19 @@ impl SelectItem for MouseOptType {
 
     fn title(&self) -> SharedString {
         match self {
-            MouseOptType::左键单机 => "左键单机".into(),
+            MouseOptType::左键单击 => "左键单击".into(),
             MouseOptType::左键双击 => "左键双击".into(),
             MouseOptType::滚轮上滑 => "滚轮上滑".into(),
             MouseOptType::滚轮下滑 => "滚轮下滑".into(),
-            MouseOptType::滚轮单机 => "滚轮单机".into(),
-            MouseOptType::右键单机 => "右键单机".into(),
+            MouseOptType::滚轮单击 => "滚轮单击".into(),
+            MouseOptType::右键单击 => "右键单击".into(),
             MouseOptType::右键双击 => "右键双击".into(),
         }
     }
     fn value(&self) -> &Self::Value {
         // value() 需要返回引用，用一个 static 缓存
         match self {
-            MouseOptType::左键单机 => {
+            MouseOptType::左键单击 => {
                 static V: LazyLock<SharedString> = LazyLock::new(|| "鼠标".into());
                 &V
             }
@@ -82,12 +82,12 @@ impl SelectItem for MouseOptType {
                 static V: LazyLock<SharedString> = LazyLock::new(|| "滚轮下滑".into());
                 &V
             }
-            MouseOptType::滚轮单机 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "滚轮单机".into());
+            MouseOptType::滚轮单击 => {
+                static V: LazyLock<SharedString> = LazyLock::new(|| "滚轮单击".into());
                 &V
             }
-            MouseOptType::右键单机 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "右键单机".into());
+            MouseOptType::右键单击 => {
+                static V: LazyLock<SharedString> = LazyLock::new(|| "右键单击".into());
                 &V
             }
             MouseOptType::右键双击 => {
@@ -140,6 +140,7 @@ struct MyTableDelegate {
     execute_time_inputs: Vec<Entity<InputState>>,
     opt_cate_selects: Vec<Entity<SelectState<SearchableVec<OptCate>>>>,
     opt_type_selects: Vec<Entity<SelectState<SearchableVec<MouseOptType>>>>,
+    opt_cate_subscriptions: Vec<Subscription>,
 }
 
 impl MyTableDelegate {
@@ -148,13 +149,14 @@ impl MyTableDelegate {
         let  execute_time_inputs: Vec<Entity<InputState>> = vec![];
         let  opt_cate_selects: Vec<Entity<SelectState<SearchableVec<OptCate>>>> = vec![];
         let  opt_type_selects: Vec<Entity<SelectState<SearchableVec<MouseOptType>>>> = vec![];
+        let  opt_cate_subscriptions: Vec<Subscription> = vec![];
         // let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
         // for i in 0..3 {
         //     data.push(MyData {
         //         x: i + 1,
         //         y: i + 1,
         //         opt_cate: OptCate::鼠标,
-        //         opt_type: "左键单机".to_string(),
+        //         opt_type: "左键单击".to_string(),
         //         win_title: Some("chrome".to_string()),
         //         delay: 1,
         //         execute_time: 1,
@@ -190,6 +192,7 @@ impl MyTableDelegate {
             execute_time_inputs,
             opt_cate_selects,
             opt_type_selects,
+            opt_cate_subscriptions,
         }
     }
 	fn get_row_opt_cate(&self, row_ix: usize) -> &OptCate {
@@ -202,7 +205,7 @@ impl MyTableDelegate {
             x: new_row_ix + 1,
             y: new_row_ix + 1,
             opt_cate: OptCate::鼠标,
-            opt_type: "左键单机".to_string(),
+            opt_type: "左键单击".to_string(),
             win_title: Some("chrome".to_string()),
             delay: 1,
             execute_time: 1,
@@ -223,14 +226,31 @@ impl MyTableDelegate {
 		
         self.opt_cate_selects.push(select);
 
+        let opt_cate_select = self.opt_cate_selects[new_row_ix].clone();
+        let subscription = cx.subscribe_in(
+            &opt_cate_select,
+            window,
+            move |table: &mut TableState<MyTableDelegate>, _select, event: &SelectEvent<SearchableVec<OptCate>>, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    table.delegate_mut().data[new_row_ix].opt_cate = match value.as_ref() {
+                        "鼠标" => OptCate::鼠标,
+                        "键盘" => OptCate::键盘,
+                        _ => return,
+                    };
+                    cx.notify();
+                }
+            },
+        );
+        self.opt_cate_subscriptions.push(subscription);
+
 		 
         // 给新行创建 Select —— 用传进来的 window
-        let options = SearchableVec::new(vec![  MouseOptType::左键单机,
+        let options = SearchableVec::new(vec![  MouseOptType::左键单击,
             MouseOptType::左键双击,
             MouseOptType::滚轮上滑,
             MouseOptType::滚轮下滑,
-            MouseOptType::滚轮单机,
-            MouseOptType::右键单机,
+            MouseOptType::滚轮单击,
+            MouseOptType::右键单击,
             MouseOptType::右键双击,]);
         let select: Entity<SelectState<SearchableVec<MouseOptType>>> = cx.new(|cx| SelectState::new(options, Some(IndexPath::default()), window, cx));
         self.opt_type_selects.push(select);
@@ -260,12 +280,12 @@ impl TableDelegate for MyTableDelegate {
     ) -> impl IntoElement {
         div()
             .h(px(20.0)) // 👈 表头高度
-            .px_3()
             .flex()
             .items_center()
-            .justify_between()
+            .justify_center()
             .bg(gpui::rgb(0xf8f9fa))
-            .font_weight(gpui::FontWeight::BOLD)
+            .w_full()
+        
             .text_size(px(13.0))
             .child(self.column(col_ix, cx).name.clone())
     }
@@ -276,7 +296,7 @@ impl TableDelegate for MyTableDelegate {
         _: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
-        div().id(("row", row_ix)).h(px(30.0)).p(px(0.)).justify_between()
+        div().id(("row", row_ix)).h(px(30.0)).p(px(0.))
     }
 
     fn render_td(
@@ -697,7 +717,7 @@ impl Render for IClick {
 																				let delegate = table_state.delegate();
 																				for (i, row) in delegate.data.iter().enumerate() {
 																					println!(
-																						"row {}: x={}, y={}, opt_cate={:?}, opt_type={}, delay={}, execute_time={}",
+																						"row {}: x={}, y={}, opt_cate={:?}, opt_type={}, delay={}, execute_time={}", 
 																						i,
 																						row.x,
 																						row.y,
