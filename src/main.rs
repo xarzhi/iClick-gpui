@@ -18,12 +18,15 @@ use gpui_component::{Icon, IconName};
 use rdev::{Button as RdevButton, Event, EventType, Key as RdevKey, listen};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::thread;
+use std::time::Duration;
 use std::vec;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL,
-    SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SetSystemCursor, ShowWindow,
-    SystemParametersInfoW, WindowFromPoint,
+    SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW, SetSystemCursor, ShowWindow,
+    SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
 };
 
 fn set_selection_cursor(crosshair: bool) {
@@ -63,17 +66,27 @@ fn cursor_info() -> (f64, f64, String, String) {
     unsafe {
         let _ = GetCursorPos(&mut point);
     }
-    let x = point.x as f64;
-    let y = point.y as f64;
-    let (hwnd, title) = window_info_at(x, y);
-    (x, y, hwnd, title)
+    let screen_x = point.x as f64;
+    let screen_y = point.y as f64;
+    let (hwnd_text, title) = window_info_at(screen_x, screen_y);
+    let hwnd_value = usize::from_str_radix(hwnd_text.trim_start_matches("0x"), 16)
+        .ok()
+        .map(|value| HWND(value as *mut _));
+    if let Some(hwnd) = hwnd_value {
+        unsafe {
+            let _ = ScreenToClient(hwnd, &mut point);
+        }
+    }
+    (point.x as f64, point.y as f64, hwnd_text, title)
 }
 
 enum HotkeyEvent {
     MouseMove(f64, f64, String, String),
     MouseReleased,
-    AddMouse(f64, f64, String),
-    AddKeyboard(f64, f64, String),
+    AddMouse(f64, f64, String, String),
+    AddKeyboard(f64, f64, String, String),
+    ToggleExecution,
+    ExecutionFinished,
 }
 
 pub struct IClick {
@@ -86,6 +99,9 @@ pub struct IClick {
     hide_when_choose: bool,
     watch_hotkey: bool,
     hotkey_flag: Arc<AtomicBool>,
+    execution_flag: Arc<AtomicBool>,
+    is_running: bool,
+    execution_event_tx: async_channel::Sender<HotkeyEvent>,
     is_choosing: bool,
     choosing_flag: Arc<AtomicBool>,
     hidden_window: Arc<std::sync::Mutex<Option<HWND>>>,
@@ -170,6 +186,7 @@ impl SelectItem for MouseOptType {
 struct MyData {
     x: usize,
     y: usize,
+    win_hwnd: String,
     opt_cate: OptCate,
     opt_type: String,
     win_title: Option<String>,
@@ -529,6 +546,62 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 impl IClick {
+    fn toggle_execution(&mut self, cx: &mut Context<Self>) {
+        if self.is_running {
+            self.is_running = false;
+            self.execution_flag.store(false, Ordering::Release);
+            cx.notify();
+            return;
+        }
+
+        let rows = self.data_table.read(cx).delegate().data.clone();
+        if rows.is_empty() {
+            return;
+        }
+        let loop_count = self
+            .loop_count_input
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(1);
+
+        self.is_running = true;
+        self.execution_flag.store(true, Ordering::Release);
+        let execution_flag = self.execution_flag.clone();
+        let execution_event_tx = self.execution_event_tx.clone();
+        thread::spawn(move || {
+            let mut completed_loops = 0;
+            while loop_count == 0 || completed_loops < loop_count {
+                for row in &rows {
+                    if !execution_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let Some(hwnd) = parse_hwnd(&row.win_hwnd) else {
+                        continue;
+                    };
+                    for _ in 0..row.execute_time.max(1) {
+                        if !execution_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        send_row_message(hwnd, row);
+                        if row.delay > 0 {
+                            thread::sleep(Duration::from_millis(row.delay as u64));
+                        }
+                    }
+                }
+                if !execution_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                completed_loops += 1;
+            }
+            execution_flag.store(false, Ordering::Release);
+            let _ = execution_event_tx.try_send(HotkeyEvent::ExecutionFinished);
+        });
+        cx.notify();
+    }
+
     fn hide_for_selection(&mut self) {
         set_selection_cursor(true);
         if !self.hide_when_choose {
@@ -559,6 +632,7 @@ impl IClick {
         cx: &mut Context<Self>,
         x: f64,
         y: f64,
+        hwnd: String,
         title: String,
         opt_cate: OptCate,
     ) {
@@ -579,6 +653,7 @@ impl IClick {
         let data = MyData {
             x: x.round() as usize,
             y: y.round() as usize,
+            win_hwnd: hwnd,
             opt_cate,
             opt_type,
             win_title: Some(title),
@@ -603,6 +678,7 @@ impl IClick {
         let x = self.x_input.read(cx).value().parse::<usize>().unwrap_or(0);
         let y = self.y_input.read(cx).value().parse::<usize>().unwrap_or(0);
         let win_title = self.win_title_input.read(cx).value().to_string();
+        let win_hwnd = self.win_hwnd_input.read(cx).value().to_string();
         let opt_cate = if self.opt_cate == Some(1) {
             OptCate::键盘
         } else {
@@ -616,6 +692,7 @@ impl IClick {
         let data = MyData {
             x,
             y,
+            win_hwnd,
             opt_cate,
             opt_type,
             win_title: Some(win_title),
@@ -627,6 +704,34 @@ impl IClick {
             table.delegate_mut().add_row(window, cx, data);
         });
         cx.notify();
+    }
+}
+
+fn parse_hwnd(value: &str) -> Option<HWND> {
+    let value = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    usize::from_str_radix(value, 16)
+        .ok()
+        .map(|value| HWND(value as *mut std::ffi::c_void))
+}
+
+fn send_row_message(hwnd: HWND, row: &MyData) {
+    unsafe {
+        match row.opt_cate {
+            OptCate::鼠标 => {
+                let x = (row.x as u32) & 0xffff;
+                let y = (row.y as u32) & 0xffff;
+                let lparam = LPARAM(((y << 16) | x) as isize);
+                let _ = SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), lparam);
+                let _ = SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lparam);
+            }
+            OptCate::键盘 => {
+                if let Some(key) = row.opt_type.chars().next() {
+                    let wparam = WPARAM(key.to_ascii_uppercase() as usize);
+                    let _ = SendMessageW(hwnd, WM_KEYDOWN, wparam, LPARAM(0));
+                    let _ = SendMessageW(hwnd, WM_KEYUP, wparam, LPARAM(0));
+                }
+            }
+        }
     }
 }
 
@@ -896,48 +1001,20 @@ impl Render for IClick {
                                                     )
                                                     .child(
                                                         Button::new("start_pause")
-                                                            .label("开始")
+                                                            .label(if self.is_running {
+                                                                "暂停"
+                                                            } else {
+                                                                "开始"
+                                                            })
                                                             .w(px(140.0))
                                                             .cursor(CursorStyle::PointingHand)
                                                             .on_click({
-																// 	let entity = cx.entity().clone();
-                                                               	// 	move |_, _window, cx| {
-																// 	   entity.update(cx, |this, cx| {
-																// 		let value = this
-																// 			.loop_count_input
-																// 			.read(cx)
-																// 			.value()
-																// 			.to_string();
-
-																// 		println!("loop_count = {}", value);
-																// 	});
-
-                                                                // }
-																let data_table =
-                                                                    self.data_table.clone();
-																move |_, window, cx| {
-															 	data_table.update(
-                                                                        cx,
-                                                                        |state, cx| {
-                                                                            let delegate = state.delegate_mut();
-                                                                            let row_index = delegate.data.len();
-                                                                            delegate.add_row(
-                                                                                window,
-                                                                                cx,
-                                                                                MyData {
-                                                                                    x: row_index + 1,
-                                                                                    y: row_index + 1,
-                                                                                    opt_cate: OptCate::鼠标,
-                                                                                    opt_type: "左键单击".to_string(),
-                                                                                    win_title: Some("chrome".to_string()),
-                                                                                    delay: 1,
-                                                                                    execute_time: 1,
-                                                                                },
-                                                                            );
-                                                                        },
-                                                                    );
+                                                                let view = cx.entity().clone();
+                                                                move |_, _window, cx| {
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.toggle_execution(cx);
+                                                                    });
                                                                 }
-
                                                             }),
                                                     ),
                                             )
@@ -1328,6 +1405,8 @@ fn main() {
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
                         let choosing_flag = Arc::new(AtomicBool::new(false));
                         let hotkey_flag = Arc::new(AtomicBool::new(false));
+                        let execution_flag = Arc::new(AtomicBool::new(false));
+                        let (mouse_tx, mouse_rx) = async_channel::unbounded::<HotkeyEvent>();
 
                         let view = cx.new(|_| IClick {
                             active_tab: 0,
@@ -1349,6 +1428,9 @@ fn main() {
                             hide_when_choose: true,
                             watch_hotkey: false,
                             hotkey_flag: hotkey_flag.clone(),
+                            execution_flag: execution_flag.clone(),
+                            is_running: false,
+                            execution_event_tx: mouse_tx.clone(),
                             is_choosing: false,
                             choosing_flag: choosing_flag.clone(),
                             hidden_window: Arc::new(std::sync::Mutex::new(None)),
@@ -1357,35 +1439,41 @@ fn main() {
                             win_hwnd_input,
                             win_title_input,
                         });
-                        let (mouse_tx, mouse_rx) = async_channel::unbounded::<HotkeyEvent>();
                         let listener_flag = choosing_flag.clone();
                         let hotkey_listener_flag = hotkey_flag.clone();
                         std::thread::spawn(move || {
                             let callback = move |event: Event| {
                                 if listener_flag.load(Ordering::Acquire)
-                                    && let EventType::MouseMove { x, y } = event.event_type
+                                    && let EventType::MouseMove { x: _, y: _ } = event.event_type
                                 {
-                                    let (hwnd, title) = window_info_at(x, y);
-                                    let _ = mouse_tx
-                                        .try_send(HotkeyEvent::MouseMove(x, y, hwnd, title));
+                                    let (relative_x, relative_y, hwnd, title) = cursor_info();
+                                    let _ = mouse_tx.try_send(HotkeyEvent::MouseMove(
+                                        relative_x, relative_y, hwnd, title,
+                                    ));
                                 } else if listener_flag.load(Ordering::Acquire)
                                     && let EventType::ButtonRelease(RdevButton::Left) =
                                         event.event_type
                                 {
                                     set_selection_cursor(false);
                                     let _ = mouse_tx.try_send(HotkeyEvent::MouseReleased);
-                                } else if hotkey_listener_flag.load(Ordering::Acquire)
-                                    && let EventType::KeyPress(key) = event.event_type
-                                {
-                                    let (x, y, _hwnd, title) = cursor_info();
+                                } else if let EventType::KeyPress(key) = event.event_type {
+                                    if key == RdevKey::F10 {
+                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleExecution);
+                                        return;
+                                    }
+                                    if !hotkey_listener_flag.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    let (x, y, hwnd, title) = cursor_info();
                                     match key {
                                         RdevKey::F6 => {
                                             let _ = mouse_tx
-                                                .try_send(HotkeyEvent::AddMouse(x, y, title));
+                                                .try_send(HotkeyEvent::AddMouse(x, y, hwnd, title));
                                         }
                                         RdevKey::F7 => {
-                                            let _ = mouse_tx
-                                                .try_send(HotkeyEvent::AddKeyboard(x, y, title));
+                                            let _ = mouse_tx.try_send(HotkeyEvent::AddKeyboard(
+                                                x, y, hwnd, title,
+                                            ));
                                         }
                                         _ => {}
                                     }
@@ -1422,7 +1510,7 @@ fn main() {
                                             HotkeyEvent::MouseReleased if view.is_choosing => {
                                                 view.finish_selection(window, cx);
                                             }
-                                            HotkeyEvent::AddMouse(x, y, title)
+                                            HotkeyEvent::AddMouse(x, y, hwnd, title)
                                                 if view.watch_hotkey =>
                                             {
                                                 view.add_hotkey_row(
@@ -1430,11 +1518,12 @@ fn main() {
                                                     cx,
                                                     x,
                                                     y,
+                                                    hwnd,
                                                     title,
                                                     OptCate::鼠标,
                                                 );
                                             }
-                                            HotkeyEvent::AddKeyboard(x, y, title)
+                                            HotkeyEvent::AddKeyboard(x, y, hwnd, title)
                                                 if view.watch_hotkey =>
                                             {
                                                 view.add_hotkey_row(
@@ -1442,9 +1531,17 @@ fn main() {
                                                     cx,
                                                     x,
                                                     y,
+                                                    hwnd,
                                                     title,
                                                     OptCate::键盘,
                                                 );
+                                            }
+                                            HotkeyEvent::ToggleExecution => {
+                                                view.toggle_execution(cx);
+                                            }
+                                            HotkeyEvent::ExecutionFinished => {
+                                                view.is_running = false;
+                                                cx.notify();
                                             }
                                             _ => {}
                                         });
