@@ -80,52 +80,42 @@ pub enum MouseOptType {
     右键单击,
     右键双击,
 }
+
+static MOUSE_OPT_TYPE_LABELS: LazyLock<[SharedString; 7]> = LazyLock::new(|| {
+    [
+        "左键单击".into(),
+        "左键双击".into(),
+        "滚轮上滑".into(),
+        "滚轮下滑".into(),
+        "滚轮单击".into(),
+        "右键单击".into(),
+        "右键双击".into(),
+    ]
+});
+
+impl MouseOptType {
+    fn index(&self) -> usize {
+        match self {
+            Self::左键单击 => 0,
+            Self::左键双击 => 1,
+            Self::滚轮上滑 => 2,
+            Self::滚轮下滑 => 3,
+            Self::滚轮单击 => 4,
+            Self::右键单击 => 5,
+            Self::右键双击 => 6,
+        }
+    }
+}
+
 impl SelectItem for MouseOptType {
     type Value = SharedString;
 
     fn title(&self) -> SharedString {
-        match self {
-            MouseOptType::左键单击 => "左键单击".into(),
-            MouseOptType::左键双击 => "左键双击".into(),
-            MouseOptType::滚轮上滑 => "滚轮上滑".into(),
-            MouseOptType::滚轮下滑 => "滚轮下滑".into(),
-            MouseOptType::滚轮单击 => "滚轮单击".into(),
-            MouseOptType::右键单击 => "右键单击".into(),
-            MouseOptType::右键双击 => "右键双击".into(),
-        }
+        MOUSE_OPT_TYPE_LABELS[self.index()].clone()
     }
+
     fn value(&self) -> &Self::Value {
-        // value() 需要返回引用，用一个 static 缓存
-        match self {
-            MouseOptType::左键单击 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "鼠标".into());
-                &V
-            }
-            MouseOptType::左键双击 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "左键双击".into());
-                &V
-            }
-            MouseOptType::滚轮上滑 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "滚轮上滑".into());
-                &V
-            }
-            MouseOptType::滚轮下滑 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "滚轮下滑".into());
-                &V
-            }
-            MouseOptType::滚轮单击 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "滚轮单击".into());
-                &V
-            }
-            MouseOptType::右键单击 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "右键单击".into());
-                &V
-            }
-            MouseOptType::右键双击 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "右键双击".into());
-                &V
-            }
-        }
+        &MOUSE_OPT_TYPE_LABELS[self.index()]
     }
 }
 #[derive(Clone, Debug)]
@@ -140,27 +130,27 @@ struct MyData {
     execute_time: usize,
 }
 
+static OPT_CATE_LABELS: LazyLock<[SharedString; 2]> =
+    LazyLock::new(|| ["鼠标".into(), "键盘".into()]);
+
+impl OptCate {
+    fn index(&self) -> usize {
+        match self {
+            Self::鼠标 => 0,
+            Self::键盘 => 1,
+        }
+    }
+}
+
 impl SelectItem for OptCate {
     type Value = SharedString;
 
     fn title(&self) -> SharedString {
-        match self {
-            OptCate::鼠标 => "鼠标".into(),
-            OptCate::键盘 => "键盘".into(),
-        }
+        OPT_CATE_LABELS[self.index()].clone()
     }
+
     fn value(&self) -> &Self::Value {
-        // value() 需要返回引用，用一个 static 缓存
-        match self {
-            OptCate::鼠标 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "鼠标".into());
-                &V
-            }
-            OptCate::键盘 => {
-                static V: LazyLock<SharedString> = LazyLock::new(|| "键盘".into());
-                &V
-            }
-        }
+        &OPT_CATE_LABELS[self.index()]
     }
 }
 
