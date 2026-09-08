@@ -15,15 +15,15 @@ use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use gpui_component::{Icon, IconName};
-use rdev::{Button as RdevButton, Event, EventType, listen};
+use rdev::{Button as RdevButton, Event, EventType, Key as RdevKey, listen};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::vec;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL, SPI_SETCURSORS,
-    SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SetSystemCursor, ShowWindow, SystemParametersInfoW,
-    WindowFromPoint,
+    GetCursorPos, GetForegroundWindow, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL,
+    SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SetSystemCursor, ShowWindow,
+    SystemParametersInfoW, WindowFromPoint,
 };
 
 fn set_selection_cursor(crosshair: bool) {
@@ -58,6 +58,24 @@ fn window_info_at(x: f64, y: f64) -> (String, String) {
     }
 }
 
+fn cursor_info() -> (f64, f64, String, String) {
+    let mut point = POINT { x: 0, y: 0 };
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    let x = point.x as f64;
+    let y = point.y as f64;
+    let (hwnd, title) = window_info_at(x, y);
+    (x, y, hwnd, title)
+}
+
+enum HotkeyEvent {
+    MouseMove(f64, f64, String, String),
+    MouseReleased,
+    AddMouse(f64, f64, String),
+    AddKeyboard(f64, f64, String),
+}
+
 pub struct IClick {
     active_tab: usize,
     tabs: Vec<String>,
@@ -67,6 +85,7 @@ pub struct IClick {
     fuzzy_click: bool,
     hide_when_choose: bool,
     watch_hotkey: bool,
+    hotkey_flag: Arc<AtomicBool>,
     is_choosing: bool,
     choosing_flag: Arc<AtomicBool>,
     hidden_window: Arc<std::sync::Mutex<Option<HWND>>>,
@@ -534,6 +553,44 @@ impl IClick {
         }
     }
 
+    fn add_hotkey_row(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        x: f64,
+        y: f64,
+        title: String,
+        opt_cate: OptCate,
+    ) {
+        self.x_input.update(cx, |input, cx| {
+            input.set_value(&(x.round() as usize).to_string(), window, cx);
+        });
+        self.y_input.update(cx, |input, cx| {
+            input.set_value(&(y.round() as usize).to_string(), window, cx);
+        });
+        self.win_title_input.update(cx, |input, cx| {
+            input.set_value(&title, window, cx);
+        });
+
+        let opt_type = match opt_cate {
+            OptCate::鼠标 => "左键单击".to_string(),
+            OptCate::键盘 => String::new(),
+        };
+        let data = MyData {
+            x: x.round() as usize,
+            y: y.round() as usize,
+            opt_cate,
+            opt_type,
+            win_title: Some(title),
+            delay: 0,
+            execute_time: 1,
+        };
+        self.data_table.update(cx, |table, cx| {
+            table.delegate_mut().add_row(window, cx, data);
+        });
+        cx.notify();
+    }
+
     fn finish_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_choosing {
             return;
@@ -732,6 +789,10 @@ impl Render for IClick {
                                                                     view.update(cx, |this, cx| {
                                                                         this.watch_hotkey =
                                                                             !this.watch_hotkey;
+                                                                        this.hotkey_flag.store(
+                                                                            this.watch_hotkey,
+                                                                            Ordering::Release,
+                                                                        );
                                                                         cx.notify();
                                                                     });
                                                                 }
@@ -1266,6 +1327,7 @@ fn main() {
                         let delegate = MyTableDelegate::new(window, cx);
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
                         let choosing_flag = Arc::new(AtomicBool::new(false));
+                        let hotkey_flag = Arc::new(AtomicBool::new(false));
 
                         let view = cx.new(|_| IClick {
                             active_tab: 0,
@@ -1286,6 +1348,7 @@ fn main() {
                             opt_cate: Some(0),
                             hide_when_choose: true,
                             watch_hotkey: false,
+                            hotkey_flag: hotkey_flag.clone(),
                             is_choosing: false,
                             choosing_flag: choosing_flag.clone(),
                             hidden_window: Arc::new(std::sync::Mutex::new(None)),
@@ -1294,28 +1357,38 @@ fn main() {
                             win_hwnd_input,
                             win_title_input,
                         });
-                        let (mouse_tx, mouse_rx) =
-                            async_channel::unbounded::<(f64, f64, String, String, bool)>();
+                        let (mouse_tx, mouse_rx) = async_channel::unbounded::<HotkeyEvent>();
                         let listener_flag = choosing_flag.clone();
+                        let hotkey_listener_flag = hotkey_flag.clone();
                         std::thread::spawn(move || {
                             let callback = move |event: Event| {
                                 if listener_flag.load(Ordering::Acquire)
                                     && let EventType::MouseMove { x, y } = event.event_type
                                 {
                                     let (hwnd, title) = window_info_at(x, y);
-                                    let _ = mouse_tx.try_send((x, y, hwnd, title, false));
+                                    let _ = mouse_tx
+                                        .try_send(HotkeyEvent::MouseMove(x, y, hwnd, title));
                                 } else if listener_flag.load(Ordering::Acquire)
                                     && let EventType::ButtonRelease(RdevButton::Left) =
                                         event.event_type
                                 {
                                     set_selection_cursor(false);
-                                    let _ = mouse_tx.try_send((
-                                        0.0,
-                                        0.0,
-                                        String::new(),
-                                        String::new(),
-                                        true,
-                                    ));
+                                    let _ = mouse_tx.try_send(HotkeyEvent::MouseReleased);
+                                } else if hotkey_listener_flag.load(Ordering::Acquire)
+                                    && let EventType::KeyPress(key) = event.event_type
+                                {
+                                    let (x, y, _hwnd, title) = cursor_info();
+                                    match key {
+                                        RdevKey::F6 => {
+                                            let _ = mouse_tx
+                                                .try_send(HotkeyEvent::AddMouse(x, y, title));
+                                        }
+                                        RdevKey::F7 => {
+                                            let _ = mouse_tx
+                                                .try_send(HotkeyEvent::AddKeyboard(x, y, title));
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             };
                             if let Err(error) = listen(callback) {
@@ -1326,15 +1399,12 @@ fn main() {
                         let mouse_view = view.clone();
                         window
                             .spawn(cx, async move |window_cx| {
-                                while let Ok((x, y, hwnd, title, released)) = mouse_rx.recv().await
-                                {
+                                while let Ok(event) = mouse_rx.recv().await {
                                     let _ = window_cx.update(|window, cx| {
-                                        mouse_view.update(cx, |view, cx| {
-                                            if view.is_choosing {
-                                                if released {
-                                                    view.finish_selection(window, cx);
-                                                    return;
-                                                }
+                                        mouse_view.update(cx, |view, cx| match event {
+                                            HotkeyEvent::MouseMove(x, y, hwnd, title)
+                                                if view.is_choosing =>
+                                            {
                                                 view.x_input.update(cx, |input, cx| {
                                                     input.set_value(&x.to_string(), window, cx);
                                                 });
@@ -1349,6 +1419,34 @@ fn main() {
                                                 });
                                                 cx.notify();
                                             }
+                                            HotkeyEvent::MouseReleased if view.is_choosing => {
+                                                view.finish_selection(window, cx);
+                                            }
+                                            HotkeyEvent::AddMouse(x, y, title)
+                                                if view.watch_hotkey =>
+                                            {
+                                                view.add_hotkey_row(
+                                                    window,
+                                                    cx,
+                                                    x,
+                                                    y,
+                                                    title,
+                                                    OptCate::鼠标,
+                                                );
+                                            }
+                                            HotkeyEvent::AddKeyboard(x, y, title)
+                                                if view.watch_hotkey =>
+                                            {
+                                                view.add_hotkey_row(
+                                                    window,
+                                                    cx,
+                                                    x,
+                                                    y,
+                                                    title,
+                                                    OptCate::键盘,
+                                                );
+                                            }
+                                            _ => {}
                                         });
                                     });
                                 }
