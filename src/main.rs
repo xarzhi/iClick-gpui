@@ -16,7 +16,8 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use gpui_component::{Icon, IconName};
 use rdev::{Event, EventType, listen};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::vec;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, WindowFromPoint};
@@ -52,6 +53,7 @@ pub struct IClick {
     hide_when_choose: bool,
     watch_hotkey: bool,
     is_choosing: bool,
+    choosing_flag: Arc<AtomicBool>,
     x_input: Entity<InputState>,
     y_input: Entity<InputState>,
     win_hwnd_input: Entity<InputState>,
@@ -508,6 +510,7 @@ impl IClick {
         }
 
         self.is_choosing = false;
+        self.choosing_flag.store(false, Ordering::Release);
 
         let x = self.x_input.read(cx).value().parse::<usize>().unwrap_or(0);
         let y = self.y_input.read(cx).value().parse::<usize>().unwrap_or(0);
@@ -607,6 +610,7 @@ impl Render for IClick {
                                                                         MouseButton::Left,
                                                                         cx.listener(|view, _, _, cx| {
                                                                             view.is_choosing = true;
+                                                                            view.choosing_flag.store(true, Ordering::Release);
                                                                             cx.notify();
                                                                         }),
                                                                     )
@@ -1219,6 +1223,7 @@ fn main() {
 
                         let delegate = MyTableDelegate::new(window, cx);
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
+                        let choosing_flag = Arc::new(AtomicBool::new(false));
 
                         let view = cx.new(|_| IClick {
                             active_tab: 0,
@@ -1239,6 +1244,7 @@ fn main() {
                             hide_when_choose: true,
                             watch_hotkey: false,
                             is_choosing: false,
+                            choosing_flag: choosing_flag.clone(),
                             x_input,
                             y_input,
                             win_hwnd_input,
@@ -1246,9 +1252,12 @@ fn main() {
                         });
                         let (mouse_tx, mouse_rx) =
                             async_channel::unbounded::<(f64, f64, String, String)>();
+                        let listener_flag = choosing_flag.clone();
                         std::thread::spawn(move || {
                             let callback = move |event: Event| {
-                                if let EventType::MouseMove { x, y } = event.event_type {
+                                if listener_flag.load(Ordering::Acquire)
+                                    && let EventType::MouseMove { x, y } = event.event_type
+                                {
                                     let (hwnd, title) = window_info_at(x, y);
                                     let _ = mouse_tx.try_send((x, y, hwnd, title));
                                 }
