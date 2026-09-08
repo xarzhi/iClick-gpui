@@ -62,7 +62,19 @@ pub struct IClick {
     fuzzy_round_input: Entity<InputState>, // 模糊范围
     loop_gap_ipt: Entity<InputState>,      // 循环间隔
     opt_gap_ipt: Entity<InputState>,       // 循环间隔
+    _input_subscriptions: Vec<Subscription>,
     data_table: Entity<TableState<MyTableDelegate>>,
+}
+
+fn subscribe_select_all(input: &Entity<InputState>, cx: &mut App) -> Subscription {
+    cx.subscribe(input, move |state, event: &InputEvent, cx| {
+        if let InputEvent::Focus = event {
+            let length = state.read(cx).value().len();
+            state.update(cx, |input, cx| {
+                input.set_selected_range(0..length, cx);
+            });
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -253,7 +265,12 @@ impl MyTableDelegate {
                   event: &InputEvent,
                   _window,
                   cx: &mut Context<TableState<MyTableDelegate>>| {
-                if let InputEvent::Change = event {
+                if let InputEvent::Focus = event {
+                    let length = input.read(cx).value().len();
+                    input.update(cx, |state, cx| {
+                        state.set_selected_range(0..length, cx);
+                    });
+                } else if let InputEvent::Change = event {
                     if let Ok(value) = input.read(cx).value().parse::<usize>() {
                         table.delegate_mut().data[new_row_ix].delay = value;
                         cx.notify();
@@ -278,7 +295,12 @@ impl MyTableDelegate {
                   event: &InputEvent,
                   _window,
                   cx: &mut Context<TableState<MyTableDelegate>>| {
-                if let InputEvent::Change = event {
+                if let InputEvent::Focus = event {
+                    let length = input.read(cx).value().len();
+                    input.update(cx, |state, cx| {
+                        state.set_selected_range(0..length, cx);
+                    });
+                } else if let InputEvent::Change = event {
                     if let Ok(value) = input.read(cx).value().parse::<usize>() {
                         table.delegate_mut().data[new_row_ix].execute_time = value;
                         cx.notify();
@@ -303,7 +325,12 @@ impl MyTableDelegate {
                   event: &InputEvent,
                   _window,
                   cx: &mut Context<TableState<MyTableDelegate>>| {
-                if let InputEvent::Change = event {
+                if let InputEvent::Focus = event {
+                    let length = input.read(cx).value().len();
+                    input.update(cx, |state, cx| {
+                        state.set_selected_range(0..length, cx);
+                    });
+                } else if let InputEvent::Change = event {
                     table.delegate_mut().data[new_row_ix].opt_type =
                         input.read(cx).value().to_string();
                     cx.notify();
@@ -1210,6 +1237,16 @@ fn main() {
                         });
                         let win_hwnd_input = cx.new(|cx| InputState::new(window, cx));
                         let win_title_input = cx.new(|cx| InputState::new(window, cx));
+                        let input_subscriptions = vec![
+                            subscribe_select_all(&loop_count_input, cx),
+                            subscribe_select_all(&fuzzy_round_input, cx),
+                            subscribe_select_all(&opt_gap_ipt, cx),
+                            subscribe_select_all(&loop_gap_ipt, cx),
+                            subscribe_select_all(&x_input, cx),
+                            subscribe_select_all(&y_input, cx),
+                            subscribe_select_all(&win_hwnd_input, cx),
+                            subscribe_select_all(&win_title_input, cx),
+                        ];
 
                         let delegate = MyTableDelegate::new(window, cx);
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
@@ -1226,6 +1263,7 @@ fn main() {
                             fuzzy_round_input,
                             loop_gap_ipt,
                             opt_gap_ipt,
+                            _input_subscriptions: input_subscriptions,
                             data_table: state,
                             always_on_top: false,
                             front_opt: false,
