@@ -7,14 +7,15 @@ use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::group_box::GroupBox;
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::radio::{RadioGroup};
+use gpui_component::kbd::Kbd;
+use gpui_component::radio::RadioGroup;
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use gpui_component::{Icon, IconName};
-use gpui_component::tooltip::Tooltip;
-use gpui_component::kbd::Kbd;
+use rdev::{Event, EventType, listen};
 use std::sync::LazyLock;
 use std::vec;
 
@@ -27,10 +28,15 @@ pub struct IClick {
     fuzzy_click: bool,
     hide_when_choose: bool,
     watch_hotkey: bool,
+    is_choosing: bool,
+    x_input: Entity<InputState>,
+    y_input: Entity<InputState>,
+    win_hwnd_input: Entity<InputState>,
+    win_title_input: Entity<InputState>,
     loop_count_input: Entity<InputState>,  // 循环次数
-    fuzzy_round_input: Entity<InputState>,	// 模糊范围
-    loop_gap_ipt: Entity<InputState>,	// 循环间隔
-    opt_gap_ipt: Entity<InputState>,	// 循环间隔
+    fuzzy_round_input: Entity<InputState>, // 模糊范围
+    loop_gap_ipt: Entity<InputState>,      // 循环间隔
+    opt_gap_ipt: Entity<InputState>,       // 循环间隔
     data_table: Entity<TableState<MyTableDelegate>>,
 }
 
@@ -94,7 +100,6 @@ impl SelectItem for MouseOptType {
                 static V: LazyLock<SharedString> = LazyLock::new(|| "右键双击".into());
                 &V
             }
-       
         }
     }
 }
@@ -150,16 +155,16 @@ struct MyTableDelegate {
 
 impl MyTableDelegate {
     fn new(_window: &mut Window, _cx: &mut App) -> Self {
-        let  data: Vec<MyData> = vec![];
-        let  delay_inputs: Vec<Entity<InputState>> = vec![];
-        let  execute_time_inputs: Vec<Entity<InputState>> = vec![];
-        let  opt_type_inputs: Vec<Entity<InputState>> = vec![];
-        let  opt_cate_selects: Vec<Entity<SelectState<SearchableVec<OptCate>>>> = vec![];
-        let  opt_type_selects: Vec<Entity<SelectState<SearchableVec<MouseOptType>>>> = vec![];
-        let  delay_subscriptions: Vec<Subscription> = vec![];
-        let  execute_time_subscriptions: Vec<Subscription> = vec![];
-        let  opt_cate_subscriptions: Vec<Subscription> = vec![];
-        let  opt_type_subscriptions: Vec<Subscription> = vec![];
+        let data: Vec<MyData> = vec![];
+        let delay_inputs: Vec<Entity<InputState>> = vec![];
+        let execute_time_inputs: Vec<Entity<InputState>> = vec![];
+        let opt_type_inputs: Vec<Entity<InputState>> = vec![];
+        let opt_cate_selects: Vec<Entity<SelectState<SearchableVec<OptCate>>>> = vec![];
+        let opt_type_selects: Vec<Entity<SelectState<SearchableVec<MouseOptType>>>> = vec![];
+        let delay_subscriptions: Vec<Subscription> = vec![];
+        let execute_time_subscriptions: Vec<Subscription> = vec![];
+        let opt_cate_subscriptions: Vec<Subscription> = vec![];
+        let opt_type_subscriptions: Vec<Subscription> = vec![];
         // let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
         // for i in 0..3 {
         //     data.push(MyData {
@@ -210,7 +215,7 @@ impl MyTableDelegate {
             opt_type_subscriptions,
         }
     }
-	fn get_row_opt_cate(&self, row_ix: usize) -> &OptCate {
+    fn get_row_opt_cate(&self, row_ix: usize) -> &OptCate {
         &self.data[row_ix].opt_cate
     }
 
@@ -236,7 +241,11 @@ impl MyTableDelegate {
         let subscription = cx.subscribe_in(
             &delay_input,
             window,
-            move |table: &mut TableState<MyTableDelegate>, input, event: &InputEvent, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+            move |table: &mut TableState<MyTableDelegate>,
+                  input,
+                  event: &InputEvent,
+                  _window,
+                  cx: &mut Context<TableState<MyTableDelegate>>| {
                 if let InputEvent::Change = event {
                     if let Ok(value) = input.read(cx).value().parse::<usize>() {
                         table.delegate_mut().data[new_row_ix].delay = value;
@@ -257,7 +266,11 @@ impl MyTableDelegate {
         let subscription = cx.subscribe_in(
             &execute_time_input,
             window,
-            move |table: &mut TableState<MyTableDelegate>, input, event: &InputEvent, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+            move |table: &mut TableState<MyTableDelegate>,
+                  input,
+                  event: &InputEvent,
+                  _window,
+                  cx: &mut Context<TableState<MyTableDelegate>>| {
                 if let InputEvent::Change = event {
                     if let Ok(value) = input.read(cx).value().parse::<usize>() {
                         table.delegate_mut().data[new_row_ix].execute_time = value;
@@ -278,9 +291,14 @@ impl MyTableDelegate {
         let subscription = cx.subscribe_in(
             &opt_type_input,
             window,
-            move |table: &mut TableState<MyTableDelegate>, input, event: &InputEvent, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+            move |table: &mut TableState<MyTableDelegate>,
+                  input,
+                  event: &InputEvent,
+                  _window,
+                  cx: &mut Context<TableState<MyTableDelegate>>| {
                 if let InputEvent::Change = event {
-                    table.delegate_mut().data[new_row_ix].opt_type = input.read(cx).value().to_string();
+                    table.delegate_mut().data[new_row_ix].opt_type =
+                        input.read(cx).value().to_string();
                     cx.notify();
                 }
             },
@@ -291,14 +309,18 @@ impl MyTableDelegate {
         let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
 
         let select = cx.new(|cx| SelectState::new(options, Some(IndexPath::default()), window, cx));
-		
+
         self.opt_cate_selects.push(select);
 
         let opt_cate_select = self.opt_cate_selects[new_row_ix].clone();
         let subscription = cx.subscribe_in(
             &opt_cate_select,
             window,
-            move |table: &mut TableState<MyTableDelegate>, _select, event: &SelectEvent<SearchableVec<OptCate>>, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+            move |table: &mut TableState<MyTableDelegate>,
+                  _select,
+                  event: &SelectEvent<SearchableVec<OptCate>>,
+                  _window,
+                  cx: &mut Context<TableState<MyTableDelegate>>| {
                 if let SelectEvent::Confirm(Some(value)) = event {
                     table.delegate_mut().data[new_row_ix].opt_cate = match value.as_ref() {
                         "鼠标" => OptCate::鼠标,
@@ -311,16 +333,18 @@ impl MyTableDelegate {
         );
         self.opt_cate_subscriptions.push(subscription);
 
-		 
         // 给新行创建 Select —— 用传进来的 window
-        let options = SearchableVec::new(vec![  MouseOptType::左键单击,
+        let options = SearchableVec::new(vec![
+            MouseOptType::左键单击,
             MouseOptType::左键双击,
             MouseOptType::滚轮上滑,
             MouseOptType::滚轮下滑,
             MouseOptType::滚轮单击,
             MouseOptType::右键单击,
-            MouseOptType::右键双击,]);
-        let select: Entity<SelectState<SearchableVec<MouseOptType>>> = cx.new(|cx| SelectState::new(options, Some(IndexPath::default()), window, cx));
+            MouseOptType::右键双击,
+        ]);
+        let select: Entity<SelectState<SearchableVec<MouseOptType>>> =
+            cx.new(|cx| SelectState::new(options, Some(IndexPath::default()), window, cx));
         self.opt_type_selects.push(select);
 
         cx.notify();
@@ -353,7 +377,6 @@ impl TableDelegate for MyTableDelegate {
             .justify_center()
             .bg(gpui::rgb(0xf8f9fa))
             .w_full()
-        
             .text_size(px(13.0))
             .child(self.column(col_ix, cx).name.clone())
     }
@@ -389,42 +412,36 @@ impl TableDelegate for MyTableDelegate {
                     Select::new(&self.opt_cate_selects[row_ix])
                         .placeholder("选择类型")
                         .small()
-                        .w(px(70.0))
+                        .w(px(70.0)),
                 )
                 .into_any_element(),
-            "opt_type" => {
-				match self.get_row_opt_cate(row_ix) {
-					OptCate::鼠标 => {
-						div()
-							.flex()
-							.items_center()
-							.rounded_sm()
-							.child(
-								Select::new(&self.opt_type_selects[row_ix])
-									.placeholder("操作方式")
-									.small()
-									.w(px(95.0)),
-							)
-							.into_any_element()
-					}
-					OptCate::键盘 => {
-						div()
-							.flex()
-							.items_center()
-							.rounded_sm()
-							.child(
-                                Input::new(&self.opt_type_inputs[row_ix])
-									.size_full()
-									.w(px(95.0))
-									.px_1()
-									.text_xs()
-									.rounded(px(4.0))
-									.py_0()
-							)
-							.into_any_element()
-					}
-				}
-			},
+            "opt_type" => match self.get_row_opt_cate(row_ix) {
+                OptCate::鼠标 => div()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .child(
+                        Select::new(&self.opt_type_selects[row_ix])
+                            .placeholder("操作方式")
+                            .small()
+                            .w(px(95.0)),
+                    )
+                    .into_any_element(),
+                OptCate::键盘 => div()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .child(
+                        Input::new(&self.opt_type_inputs[row_ix])
+                            .size_full()
+                            .w(px(95.0))
+                            .px_1()
+                            .text_xs()
+                            .rounded(px(4.0))
+                            .py_0(),
+                    )
+                    .into_any_element(),
+            },
             "win_title" => row.win_title.clone().unwrap().into_any_element(),
             "delay" => div()
                 .flex()
@@ -519,15 +536,46 @@ impl Render for IClick {
                                                     .justify_between()
                                                     .child(
                                                         div()
-                                                            .border(px(1.0))
-                                                            .border_color(cx.theme().border)
-                                                            .w(px(30.))
-                                                            .h(px(30.))
-                                                            .cursor(CursorStyle::Crosshair)
+                                                            .flex()
+                                                            .items_center()
                                                             .child(
-                                                                Icon::new(IconName::Plus)
-                                                                    .size_full()
-                                                                    .text_color(rgb(0x1f44fa)),
+                                                                div()
+                                                                    .border(px(1.0))
+                                                                    .border_color(cx.theme().border)
+                                                                    .w(px(30.))
+                                                                    .h(px(30.))
+                                                                    .cursor(CursorStyle::Crosshair)
+                                                                    .on_mouse_down(
+                                                                        MouseButton::Left,
+                                                                        cx.listener(|view, _, _, cx| {
+                                                                            view.is_choosing = true;
+                                                                            cx.notify();
+                                                                        }),
+                                                                    )
+                                                                    .on_mouse_up(
+                                                                        MouseButton::Left,
+                                                                        cx.listener(|view, _, _, cx| {
+                                                                            view.is_choosing = false;
+                                                                            cx.notify();
+                                                                        }),
+                                                                    )
+                                                                    .on_mouse_up_out(
+                                                                        MouseButton::Left,
+                                                                        cx.listener(|view, _, _, cx| {
+                                                                            view.is_choosing = false;
+                                                                            cx.notify();
+                                                                        }),
+                                                                    )
+                                                                    .child(
+                                                                        Icon::new(IconName::Plus)
+                                                                            .size_full()
+                                                                            .text_color(rgb(0x1f44fa)),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .ml(px(8.0))
+                                                                    .child(self.is_choosing.to_string()),
                                                             ),
                                                     )
                                                     .child(
@@ -645,15 +693,14 @@ impl Render for IClick {
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
-                                                
+
                                                     .child(
 														div()
                 										.flex()
                                                     .id("set_on_top")
                                                     .cursor(CursorStyle::PointingHand)
-
                         								.items_center()
-														    .on_click({
+                                	.on_click({
                                                                 let view = cx.entity().clone();
                                                                 move |_, _window, cx| {
                                                                     view.update(cx, |this, cx| {
@@ -692,7 +739,7 @@ impl Render for IClick {
                                                             .label("")
                                                             .checked(self.always_on_top)
 														)
-                                                     
+
                                                     )
                                                     .child(
                                                         Button::new("start_pause")
@@ -711,7 +758,7 @@ impl Render for IClick {
 
 																// 		println!("loop_count = {}", value);
 																// 	});
-                                                                   
+
                                                                 // }
 																let data_table =
                                                                     self.data_table.clone();
@@ -760,7 +807,7 @@ impl Render for IClick {
 														.child( Checkbox::new("front_check")
                                                             .label("")
                                                             .checked(self.front_opt)
-                                                          
+
 													)
                                                     )
                                                     .child(
@@ -783,7 +830,7 @@ impl Render for IClick {
 																				let delegate = table_state.delegate();
 																				for (i, row) in delegate.data.iter().enumerate() {
 																					println!(
-																						"row {}: x={}, y={}, opt_cate={:?}, opt_type={}, delay={}, execute_time={}", 
+																						"row {}: x={}, y={}, opt_cate={:?}, opt_type={}, delay={}, execute_time={}",
 																						i,
 																						row.x,
 																						row.y,
@@ -875,9 +922,9 @@ impl Render for IClick {
 														).child(  Checkbox::new("fuzzy_click")
                                                             .label("")
                                                             .checked(self.fuzzy_click)
-                                                            
+
 														)
-                                                      
+
                                                     )
                                                     .child(
                                                         div()
@@ -951,15 +998,85 @@ impl Render for IClick {
                                                             .child("开始/暂停快捷键"),
                                                     )
                                                     .child(
-                                                        // Checkbox::new("terms")
-                                                        //     .label("")
-                                                        //     .checked(false),
 														Kbd::new(Keystroke::parse("f8").unwrap()).outline().pt_1().pb_1().min_w(px(100.))
                                                     ),
                                             ),
                                     ),
                             ),
                     )
+                    .child(
+						div()
+						.mb(px(10.))
+						.flex()
+						.justify_between()
+						.items_center()
+						.child(
+						    div()
+							.flex()
+							.items_center()
+    						.mr(px(10.))
+							.child(
+								div()
+									.mr(px(10.0))
+									.child("X：")
+									.id("x")
+
+							)
+							.child(div().child(
+                                                Input::new(&self.x_input).small().w(px(55.)),
+							)),
+						)
+						.child(
+						    div()
+							.flex()
+							.items_center()
+    						.mr(px(10.))
+
+							.child(
+								div()
+									.mr(px(10.0))
+									.child("Y：")
+									.id("y")
+
+							)
+							.child(div().child(
+                                                Input::new(&self.y_input).small().w(px(55.)),
+							)),
+						)
+						.child(
+						    div()
+							.flex()
+							.flex_1()
+							.items_center()
+    						.mr(px(10.))
+
+							.child(
+								div()
+									.mr(px(10.0))
+									.child("窗口句柄：")
+									.id("win_hwnd")
+
+							)
+							.child(div().flex_1().child(
+                                                Input::new(&self.win_hwnd_input).small(),
+							)),
+						)
+						.child(
+						    div()
+							.flex()
+							.items_center()
+							.flex_1()
+							.child(
+								div()
+									.mr(px(10.0))
+									.child("窗口标题：")
+									.id("win_title")
+							)
+							.child(div().flex_1().child(
+                                                Input::new(&self.win_title_input).small(),
+							))
+						)
+					)
                     .child(
                         div()
                             .w_full()
@@ -1001,11 +1118,38 @@ fn main() {
                         ..WindowOptions::default()
                     },
                     |window, cx| {
-                        let loop_count_input = cx.new(|cx| InputState::new(window, cx).default_value("1").pattern(Regex::new(r"^[0-9]\d*$").unwrap()));
-                        let fuzzy_round_input = cx.new(|cx| InputState::new(window, cx).default_value("0").pattern(Regex::new(r"^[0-9]\d*$").unwrap()));
-						  let opt_gap_ipt = cx.new(|cx| InputState::new(window, cx).default_value("20").pattern(Regex::new(r"^[0-9]\d*$").unwrap()));
-                        let loop_gap_ipt = cx.new(|cx| InputState::new(window, cx).default_value("0").pattern(Regex::new(r"^[0-9]\d*$").unwrap()));
-                      
+                        let loop_count_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("1")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let fuzzy_round_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("0")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let opt_gap_ipt = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("20")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let loop_gap_ipt = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("0")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let x_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("0")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let y_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("0")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let win_hwnd_input = cx.new(|cx| InputState::new(window, cx));
+                        let win_title_input = cx.new(|cx| InputState::new(window, cx));
 
                         let delegate = MyTableDelegate::new(window, cx);
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
@@ -1019,8 +1163,8 @@ fn main() {
                             ],
                             loop_count_input,
                             fuzzy_round_input,
-							loop_gap_ipt,
-							opt_gap_ipt,
+                            loop_gap_ipt,
+                            opt_gap_ipt,
                             data_table: state,
                             always_on_top: false,
                             front_opt: false,
@@ -1028,7 +1172,44 @@ fn main() {
                             opt_cate: Some(0),
                             hide_when_choose: true,
                             watch_hotkey: false,
+                            is_choosing: false,
+                            x_input,
+                            y_input,
+                            win_hwnd_input,
+                            win_title_input,
                         });
+                        let (mouse_tx, mouse_rx) = async_channel::unbounded::<(f64, f64)>();
+                        std::thread::spawn(move || {
+                            let callback = move |event: Event| {
+                                if let EventType::MouseMove { x, y } = event.event_type {
+                                    let _ = mouse_tx.try_send((x, y));
+                                }
+                            };
+                            if let Err(error) = listen(callback) {
+                                eprintln!("rdev mouse listener stopped: {error:?}");
+                            }
+                        });
+
+                        let mouse_view = view.clone();
+                        window
+                            .spawn(cx, async move |window_cx| {
+                                while let Ok((x, y)) = mouse_rx.recv().await {
+                                    let _ = window_cx.update(|window, cx| {
+                                        mouse_view.update(cx, |view, cx| {
+                                            if view.is_choosing {
+                                                view.x_input.update(cx, |input, cx| {
+                                                    input.set_value(&x.to_string(), window, cx);
+                                                });
+                                                view.y_input.update(cx, |input, cx| {
+                                                    input.set_value(&y.to_string(), window, cx);
+                                                });
+                                                cx.notify();
+                                            }
+                                        });
+                                    });
+                                }
+                            })
+                            .detach();
                         cx.new(|cx| Root::new(view, window, cx))
                     },
                 )
