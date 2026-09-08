@@ -6,7 +6,7 @@ use gpui::*;
 use gpui_component::button::Button;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::group_box::GroupBox;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::radio::{RadioGroup};
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::tab::{Tab, TabBar};
@@ -137,19 +137,29 @@ impl SelectItem for OptCate {
 struct MyTableDelegate {
     data: Vec<MyData>,
     columns: Vec<Column>,
+    delay_inputs: Vec<Entity<InputState>>,
     execute_time_inputs: Vec<Entity<InputState>>,
+    opt_type_inputs: Vec<Entity<InputState>>,
     opt_cate_selects: Vec<Entity<SelectState<SearchableVec<OptCate>>>>,
     opt_type_selects: Vec<Entity<SelectState<SearchableVec<MouseOptType>>>>,
+    delay_subscriptions: Vec<Subscription>,
+    execute_time_subscriptions: Vec<Subscription>,
     opt_cate_subscriptions: Vec<Subscription>,
+    opt_type_subscriptions: Vec<Subscription>,
 }
 
 impl MyTableDelegate {
     fn new(_window: &mut Window, _cx: &mut App) -> Self {
         let  data: Vec<MyData> = vec![];
+        let  delay_inputs: Vec<Entity<InputState>> = vec![];
         let  execute_time_inputs: Vec<Entity<InputState>> = vec![];
+        let  opt_type_inputs: Vec<Entity<InputState>> = vec![];
         let  opt_cate_selects: Vec<Entity<SelectState<SearchableVec<OptCate>>>> = vec![];
         let  opt_type_selects: Vec<Entity<SelectState<SearchableVec<MouseOptType>>>> = vec![];
+        let  delay_subscriptions: Vec<Subscription> = vec![];
+        let  execute_time_subscriptions: Vec<Subscription> = vec![];
         let  opt_cate_subscriptions: Vec<Subscription> = vec![];
+        let  opt_type_subscriptions: Vec<Subscription> = vec![];
         // let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
         // for i in 0..3 {
         //     data.push(MyData {
@@ -186,13 +196,18 @@ impl MyTableDelegate {
                 Column::new("opt_cate", "操作类型").width(80.),
                 Column::new("opt_type", "操作方式").width(120.),
                 Column::new("win_title", "窗口标题").width(100.),
-                Column::new("delay", "延迟").width(80.),
+                Column::new("delay", "延迟(ms)").width(80.),
                 Column::new("execute_time", "执行次数").width(80.),
             ],
+            delay_inputs,
             execute_time_inputs,
+            opt_type_inputs,
             opt_cate_selects,
             opt_type_selects,
+            delay_subscriptions,
+            execute_time_subscriptions,
             opt_cate_subscriptions,
+            opt_type_subscriptions,
         }
     }
 	fn get_row_opt_cate(&self, row_ix: usize) -> &OptCate {
@@ -211,13 +226,66 @@ impl MyTableDelegate {
             execute_time: 1,
         });
 
-        // 给新行创建 Input —— 用传进来的 window
-        let input = cx.new(|cx| {
+        let delay_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).pattern(Regex::new(r"^[0-9]\d*$").unwrap());
+            state.set_value("1", window, cx);
+            state
+        });
+        self.delay_inputs.push(delay_input.clone());
+
+        let subscription = cx.subscribe_in(
+            &delay_input,
+            window,
+            move |table: &mut TableState<MyTableDelegate>, input, event: &InputEvent, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+                if let InputEvent::Change = event {
+                    if let Ok(value) = input.read(cx).value().parse::<usize>() {
+                        table.delegate_mut().data[new_row_ix].delay = value;
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        self.delay_subscriptions.push(subscription);
+
+        let execute_time_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).pattern(Regex::new(r"^[0-9]\d*$").unwrap());
+            state.set_value("1", window, cx);
+            state
+        });
+        self.execute_time_inputs.push(execute_time_input.clone());
+
+        let subscription = cx.subscribe_in(
+            &execute_time_input,
+            window,
+            move |table: &mut TableState<MyTableDelegate>, input, event: &InputEvent, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+                if let InputEvent::Change = event {
+                    if let Ok(value) = input.read(cx).value().parse::<usize>() {
+                        table.delegate_mut().data[new_row_ix].execute_time = value;
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        self.execute_time_subscriptions.push(subscription);
+
+        let opt_type_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx);
             state.set_value("", window, cx);
             state
         });
-        self.execute_time_inputs.push(input);
+        self.opt_type_inputs.push(opt_type_input.clone());
+
+        let subscription = cx.subscribe_in(
+            &opt_type_input,
+            window,
+            move |table: &mut TableState<MyTableDelegate>, input, event: &InputEvent, _window, cx: &mut Context<TableState<MyTableDelegate>>| {
+                if let InputEvent::Change = event {
+                    table.delegate_mut().data[new_row_ix].opt_type = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        );
+        self.opt_type_subscriptions.push(subscription);
 
         // 给新行创建 Select —— 用传进来的 window
         let options = SearchableVec::new(vec![OptCate::鼠标, OptCate::键盘]);
@@ -322,8 +390,6 @@ impl TableDelegate for MyTableDelegate {
                         .placeholder("选择类型")
                         .small()
                         .w(px(70.0))
-                        
-						,
                 )
                 .into_any_element(),
             "opt_type" => {
@@ -347,7 +413,7 @@ impl TableDelegate for MyTableDelegate {
 							.items_center()
 							.rounded_sm()
 							.child(
-								Input::new(&self.execute_time_inputs[row_ix]) // 复用 delay 的 input 或单独建一个
+                                Input::new(&self.opt_type_inputs[row_ix])
 									.size_full()
 									.w(px(95.0))
 									.px_1()
@@ -365,9 +431,9 @@ impl TableDelegate for MyTableDelegate {
                 .items_center()
                 .rounded_sm()
                 .child(
-                    Input::new(&self.execute_time_inputs[row_ix])
+                    Input::new(&self.delay_inputs[row_ix])
                         .size_full()
-                        .w(px(50.))
+                        .w(px(65.))
                         .px_1()
                         .text_xs()
                         .rounded(px(4.))
