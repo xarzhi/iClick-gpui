@@ -934,7 +934,7 @@ fn keyboard_key_label(key: &RdevKey, shift_pressed: bool) -> String {
         RdevKey::ScrollLock => "SCROLLLOCK",
         RdevKey::Pause => "PAUSE",
         RdevKey::NumLock => "NUMLOCK",
-        RdevKey::BackQuote => "BACKQUOTE",
+        RdevKey::BackQuote => "BackQuote",
         RdevKey::Minus | RdevKey::KpMinus => "MINUS",
         RdevKey::Equal | RdevKey::KpPlus => "EQUAL",
         RdevKey::LeftBracket => "LEFTBRACKET",
