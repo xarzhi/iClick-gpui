@@ -1,4 +1,4 @@
-﻿// #![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -8,6 +8,7 @@ use gpui_component::checkbox::Checkbox;
 use gpui_component::group_box::GroupBox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::radio::RadioGroup;
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::tab::{Tab, TabBar};
@@ -23,10 +24,16 @@ use std::time::Duration;
 use std::vec;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, MapVirtualKeyW,
+    SendInput, VIRTUAL_KEY,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL,
-    SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW, SetSystemCursor, ShowWindow,
-    SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
+    SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW, SetCursorPos,
+    SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW, WM_CHAR, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
 };
 
 fn set_selection_cursor(crosshair: bool) {
@@ -85,6 +92,7 @@ enum HotkeyEvent {
     MouseReleased,
     AddMouse(f64, f64, String, String),
     AddKeyboard(f64, f64, String, String),
+    KeyboardInput(usize, String),
     ToggleExecution,
     ExecutionFinished,
 }
@@ -230,10 +238,17 @@ struct MyTableDelegate {
     execute_time_subscriptions: Vec<Subscription>,
     opt_cate_subscriptions: Vec<Subscription>,
     opt_type_subscriptions: Vec<Subscription>,
+    focused_keyboard_row: Arc<std::sync::Mutex<Option<usize>>>,
+    expected_keyboard_value: Arc<std::sync::Mutex<Option<(usize, String)>>>,
 }
 
 impl MyTableDelegate {
-    fn new(_window: &mut Window, _cx: &mut App) -> Self {
+    fn new(
+        _window: &mut Window,
+        _cx: &mut App,
+        focused_keyboard_row: Arc<std::sync::Mutex<Option<usize>>>,
+        expected_keyboard_value: Arc<std::sync::Mutex<Option<(usize, String)>>>,
+    ) -> Self {
         let data: Vec<MyData> = vec![];
         let delay_inputs: Vec<Entity<InputState>> = vec![];
         let execute_time_inputs: Vec<Entity<InputState>> = vec![];
@@ -265,6 +280,8 @@ impl MyTableDelegate {
             execute_time_subscriptions,
             opt_cate_subscriptions,
             opt_type_subscriptions,
+            focused_keyboard_row,
+            expected_keyboard_value,
         }
     }
     fn get_row_opt_cate(&self, row_ix: usize) -> &OptCate {
@@ -350,15 +367,40 @@ impl MyTableDelegate {
                   event: &InputEvent,
                   _window,
                   cx: &mut Context<TableState<MyTableDelegate>>| {
-                if let InputEvent::Focus = event {
-                    let length = input.read(cx).value().len();
-                    input.update(cx, |state, cx| {
-                        state.set_selected_range(0..length, cx);
-                    });
-                } else if let InputEvent::Change = event {
-                    table.delegate_mut().data[new_row_ix].opt_type =
-                        input.read(cx).value().to_string();
-                    cx.notify();
+                match event {
+                    InputEvent::Focus => {
+                        let length = input.read(cx).value().len();
+                        input.update(cx, |state, cx| {
+                            state.set_selected_range(0..length, cx);
+                        });
+                        *table.delegate().focused_keyboard_row.lock().unwrap() = Some(new_row_ix);
+                    }
+                    InputEvent::Blur => {
+                        let mut focused_row = table.delegate().focused_keyboard_row.lock().unwrap();
+                        if *focused_row == Some(new_row_ix) {
+                            *focused_row = None;
+                        }
+                    }
+                    InputEvent::Change => {
+                        let expected_value = table
+                            .delegate()
+                            .expected_keyboard_value
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .filter(|(row_ix, _)| *row_ix == new_row_ix)
+                            .map(|(_, value)| value);
+                        let value =
+                            expected_value.unwrap_or_else(|| input.read(cx).value().to_string());
+                        if input.read(cx).value().as_ref() != value.as_str() {
+                            input.update(cx, |state, cx| {
+                                state.set_value(&value, _window, cx);
+                            });
+                        }
+                        table.delegate_mut().data[new_row_ix].opt_type = value;
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             },
         );
@@ -454,6 +496,22 @@ impl TableDelegate for MyTableDelegate {
         div().id(("row", row_ix)).h(px(30.0)).p(px(0.))
     }
 
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let table = cx.entity().clone();
+        menu.item(PopupMenuItem::new("删除本行").on_click(move |_, _, cx| {
+            table.update(cx, |table, cx| {
+                table.delegate_mut().remove_row(row_ix);
+                cx.notify();
+            });
+        }))
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -541,6 +599,49 @@ impl TableDelegate for MyTableDelegate {
         div().p(px(0.0)).flex().text_xs().items_center().child(text)
     }
 }
+
+impl MyTableDelegate {
+    fn remove_row(&mut self, row_ix: usize) {
+        if row_ix >= self.data.len() {
+            return;
+        }
+
+        self.data.remove(row_ix);
+        self.delay_inputs.remove(row_ix);
+        self.execute_time_inputs.remove(row_ix);
+        self.opt_type_inputs.remove(row_ix);
+        self.opt_cate_selects.remove(row_ix);
+        self.opt_type_selects.remove(row_ix);
+        self.delay_subscriptions.remove(row_ix);
+        self.execute_time_subscriptions.remove(row_ix);
+        self.opt_cate_subscriptions.remove(row_ix);
+        self.opt_type_subscriptions.remove(row_ix);
+
+        let mut focused_row = self.focused_keyboard_row.lock().unwrap();
+        if *focused_row == Some(row_ix) {
+            *focused_row = None;
+        } else if focused_row.is_some_and(|focused| focused > row_ix) {
+            *focused_row = focused_row.map(|focused| focused - 1);
+        }
+
+        let mut expected_value = self.expected_keyboard_value.lock().unwrap();
+        if expected_value
+            .as_ref()
+            .is_some_and(|(focused, _)| *focused == row_ix)
+        {
+            *expected_value = None;
+        } else if let Some((focused, value)) = expected_value.take() {
+            *expected_value = Some((
+                if focused > row_ix {
+                    focused - 1
+                } else {
+                    focused
+                },
+                value,
+            ));
+        }
+    }
+}
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
 };
@@ -564,6 +665,7 @@ impl IClick {
             .value()
             .parse::<usize>()
             .unwrap_or(1);
+        let front_opt = self.front_opt;
 
         self.is_running = true;
         self.execution_flag.store(true, Ordering::Release);
@@ -585,7 +687,7 @@ impl IClick {
                             break;
                         }
 
-                        send_row_message(hwnd, row);
+                        send_row_input(hwnd, row, front_opt);
                         if row.delay > 0 {
                             thread::sleep(Duration::from_millis(row.delay as u64));
                         }
@@ -714,10 +816,281 @@ fn parse_hwnd(value: &str) -> Option<HWND> {
         .map(|value| HWND(value as *mut std::ffi::c_void))
 }
 
-fn send_row_message(hwnd: HWND, row: &MyData) {
+fn keyboard_key_label(key: &RdevKey, shift_pressed: bool) -> String {
+    let label = match key {
+        RdevKey::KeyA => "A",
+        RdevKey::KeyB => "B",
+        RdevKey::KeyC => "C",
+        RdevKey::KeyD => "D",
+        RdevKey::KeyE => "E",
+        RdevKey::KeyF => "F",
+        RdevKey::KeyG => "G",
+        RdevKey::KeyH => "H",
+        RdevKey::KeyI => "I",
+        RdevKey::KeyJ => "J",
+        RdevKey::KeyK => "K",
+        RdevKey::KeyL => "L",
+        RdevKey::KeyM => "M",
+        RdevKey::KeyN => "N",
+        RdevKey::KeyO => "O",
+        RdevKey::KeyP => "P",
+        RdevKey::KeyQ => "Q",
+        RdevKey::KeyR => "R",
+        RdevKey::KeyS => "S",
+        RdevKey::KeyT => "T",
+        RdevKey::KeyU => "U",
+        RdevKey::KeyV => "V",
+        RdevKey::KeyW => "W",
+        RdevKey::KeyX => "X",
+        RdevKey::KeyY => "Y",
+        RdevKey::KeyZ => "Z",
+        RdevKey::Num0 => "0",
+        RdevKey::Num1 => "1",
+        RdevKey::Num2 => "2",
+        RdevKey::Num3 => "3",
+        RdevKey::Num4 => "4",
+        RdevKey::Num5 => "5",
+        RdevKey::Num6 => "6",
+        RdevKey::Num7 => "7",
+        RdevKey::Num8 => "8",
+        RdevKey::Num9 => "9",
+        RdevKey::F1 => "F1",
+        RdevKey::F2 => "F2",
+        RdevKey::F3 => "F3",
+        RdevKey::F4 => "F4",
+        RdevKey::F5 => "F5",
+        RdevKey::F6 => "F6",
+        RdevKey::F7 => "F7",
+        RdevKey::F8 => "F8",
+        RdevKey::F9 => "F9",
+        RdevKey::F10 => "F10",
+        RdevKey::F11 => "F11",
+        RdevKey::F12 => "F12",
+        RdevKey::Backspace => "BACKSPACE",
+        RdevKey::Delete => "DELETE",
+        RdevKey::Return => "ENTER",
+        RdevKey::Escape => "ESCAPE",
+        RdevKey::Space => "SPACE",
+        RdevKey::Tab => "TAB",
+        RdevKey::LeftArrow => "LEFT",
+        RdevKey::RightArrow => "RIGHT",
+        RdevKey::UpArrow => "UP",
+        RdevKey::DownArrow => "DOWN",
+        RdevKey::Home => "HOME",
+        RdevKey::End => "END",
+        RdevKey::PageUp => "PAGEUP",
+        RdevKey::PageDown => "PAGEDOWN",
+        RdevKey::Insert => "INSERT",
+        RdevKey::PrintScreen => "PRINTSCREEN",
+        RdevKey::ScrollLock => "SCROLLLOCK",
+        RdevKey::Pause => "PAUSE",
+        RdevKey::NumLock => "NUMLOCK",
+        RdevKey::BackQuote => "BACKQUOTE",
+        RdevKey::Minus | RdevKey::KpMinus => "MINUS",
+        RdevKey::Equal | RdevKey::KpPlus => "EQUAL",
+        RdevKey::LeftBracket => "LEFTBRACKET",
+        RdevKey::RightBracket => "RIGHTBRACKET",
+        RdevKey::SemiColon => "SEMICOLON",
+        RdevKey::Quote => "QUOTE",
+        RdevKey::BackSlash | RdevKey::IntlBackslash => "BACKSLASH",
+        RdevKey::Comma => "COMMA",
+        RdevKey::Dot | RdevKey::KpDelete => "DOT",
+        RdevKey::Slash | RdevKey::KpDivide => "SLASH",
+        RdevKey::KpReturn => "ENTER",
+        RdevKey::KpMultiply => "MULTIPLY",
+        RdevKey::Kp0 => "0",
+        RdevKey::Kp1 => "1",
+        RdevKey::Kp2 => "2",
+        RdevKey::Kp3 => "3",
+        RdevKey::Kp4 => "4",
+        RdevKey::Kp5 => "5",
+        RdevKey::Kp6 => "6",
+        RdevKey::Kp7 => "7",
+        RdevKey::Kp8 => "8",
+        RdevKey::Kp9 => "9",
+        RdevKey::ShiftLeft | RdevKey::ShiftRight => "SHIFT",
+        RdevKey::ControlLeft | RdevKey::ControlRight => "CTRL",
+        RdevKey::Alt | RdevKey::AltGr => "ALT",
+        RdevKey::MetaLeft | RdevKey::MetaRight => "WIN",
+        _ => return format!("{key:?}").to_uppercase(),
+    };
+    if !shift_pressed && label.len() == 1 {
+        label.to_ascii_lowercase()
+    } else {
+        label.to_string()
+    }
+}
+
+fn keyboard_virtual_key(value: &str) -> Option<usize> {
+    let value = value.trim().to_uppercase();
+    match value.as_str() {
+        "BACKSPACE" => Some(0x08),
+        "TAB" => Some(0x09),
+        "ENTER" => Some(0x0D),
+        "SHIFT" => Some(0x10),
+        "CTRL" => Some(0x11),
+        "ALT" => Some(0x12),
+        "PAUSE" => Some(0x13),
+        "CAPSLOCK" => Some(0x14),
+        "ESCAPE" => Some(0x1B),
+        "SPACE" => Some(0x20),
+        "PAGEUP" => Some(0x21),
+        "PAGEDOWN" => Some(0x22),
+        "END" => Some(0x23),
+        "HOME" => Some(0x24),
+        "LEFT" => Some(0x25),
+        "UP" => Some(0x26),
+        "RIGHT" => Some(0x27),
+        "DOWN" => Some(0x28),
+        "INSERT" => Some(0x2D),
+        "DELETE" => Some(0x2E),
+        "WIN" => Some(0x5B),
+        "PRINTSCREEN" => Some(0x2C),
+        "SCROLLLOCK" => Some(0x91),
+        "NUMLOCK" => Some(0x90),
+        "BACKQUOTE" => Some(0xC0),
+        "MINUS" => Some(0xBD),
+        "EQUAL" => Some(0xBB),
+        "LEFTBRACKET" => Some(0xDB),
+        "RIGHTBRACKET" => Some(0xDD),
+        "SEMICOLON" => Some(0xBA),
+        "QUOTE" => Some(0xDE),
+        "BACKSLASH" => Some(0xDC),
+        "COMMA" => Some(0xBC),
+        "DOT" => Some(0xBE),
+        "SLASH" => Some(0xBF),
+        "MULTIPLY" => Some(0x6A),
+        _ if value.len() == 1 && value.as_bytes()[0].is_ascii_alphanumeric() => {
+            Some(value.as_bytes()[0] as usize)
+        }
+        _ if value.len() >= 2 && value.starts_with('F') => value[1..]
+            .parse::<usize>()
+            .ok()
+            .filter(|number| (1..=24).contains(number))
+            .map(|number| 0x70 + number - 1),
+        _ => None,
+    }
+}
+
+fn send_input_key(key: &str) {
+    let is_character = key.chars().count() == 1;
+    let inputs = if !is_character {
+        let Some(vk) = keyboard_virtual_key(key) else {
+            return;
+        };
+        vec![
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk as u16),
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk as u16),
+                        dwFlags: KEYEVENTF_KEYUP,
+                        ..Default::default()
+                    },
+                },
+            },
+        ]
+    } else {
+        key.encode_utf16()
+            .flat_map(|unit| {
+                [
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VIRTUAL_KEY(0),
+                                wScan: unit,
+                                dwFlags: KEYEVENTF_UNICODE,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VIRTUAL_KEY(0),
+                                wScan: unit,
+                                dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                ]
+            })
+            .collect()
+    };
+    unsafe {
+        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn send_input_mouse(hwnd: HWND, row: &MyData) {
+    unsafe {
+        let mut point = POINT {
+            x: row.x as i32,
+            y: row.y as i32,
+        };
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetCursorPos(point.x, point.y);
+        let inputs = [
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dwFlags: MOUSEEVENTF_LEFTDOWN,
+                        ..Default::default()
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dwFlags: MOUSEEVENTF_LEFTUP,
+                        ..Default::default()
+                    },
+                },
+            },
+        ];
+        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn keyboard_message_lparam(vk: usize, key_up: bool) -> LPARAM {
+    let scan_code = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as isize;
+    let extended = matches!(
+        vk,
+        0x21..=0x2E | 0x5B..=0x5C | 0x6F | 0x90..=0x91
+    );
+    let mut value = 1isize | (scan_code << 16);
+    if extended {
+        value |= 1 << 24;
+    }
+    if key_up {
+        value |= 0xC000_0000u32 as isize;
+    }
+    LPARAM(value)
+}
+
+fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool) {
     unsafe {
         match row.opt_cate {
             OptCate::鼠标 => {
+                if front_opt {
+                    send_input_mouse(hwnd, row);
+                    return;
+                }
                 let x = (row.x as u32) & 0xffff;
                 let y = (row.y as u32) & 0xffff;
                 let lparam = LPARAM(((y << 16) | x) as isize);
@@ -725,10 +1098,26 @@ fn send_row_message(hwnd: HWND, row: &MyData) {
                 let _ = SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lparam);
             }
             OptCate::键盘 => {
-                if let Some(key) = row.opt_type.chars().next() {
-                    let wparam = WPARAM(key.to_ascii_uppercase() as usize);
-                    let _ = SendMessageW(hwnd, WM_KEYDOWN, wparam, LPARAM(0));
-                    let _ = SendMessageW(hwnd, WM_KEYUP, wparam, LPARAM(0));
+                if front_opt {
+                    send_input_key(&row.opt_type);
+                } else if row.opt_type.chars().count() == 1 {
+                    for unit in row.opt_type.encode_utf16() {
+                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+                    }
+                } else if let Some(key) = keyboard_virtual_key(&row.opt_type) {
+                    let wparam = WPARAM(key);
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_KEYDOWN,
+                        wparam,
+                        keyboard_message_lparam(key, false),
+                    );
+                    let _ =
+                        SendMessageW(hwnd, WM_KEYUP, wparam, keyboard_message_lparam(key, true));
+                } else {
+                    for unit in row.opt_type.encode_utf16() {
+                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+                    }
                 }
             }
         }
@@ -1401,7 +1790,15 @@ fn main() {
                             subscribe_select_all(&win_title_input, cx),
                         ];
 
-                        let delegate = MyTableDelegate::new(window, cx);
+                        let focused_keyboard_row = Arc::new(std::sync::Mutex::new(None::<usize>));
+                        let expected_keyboard_value =
+                            Arc::new(std::sync::Mutex::new(None::<(usize, String)>));
+                        let delegate = MyTableDelegate::new(
+                            window,
+                            cx,
+                            focused_keyboard_row.clone(),
+                            expected_keyboard_value.clone(),
+                        );
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
                         let choosing_flag = Arc::new(AtomicBool::new(false));
                         let hotkey_flag = Arc::new(AtomicBool::new(false));
@@ -1441,7 +1838,10 @@ fn main() {
                         });
                         let listener_flag = choosing_flag.clone();
                         let hotkey_listener_flag = hotkey_flag.clone();
+                        let keyboard_input_row = focused_keyboard_row.clone();
                         std::thread::spawn(move || {
+                            let mut shift_pressed = false;
+                            let mut caps_lock = false;
                             let callback = move |event: Event| {
                                 if listener_flag.load(Ordering::Acquire)
                                     && let EventType::MouseMove { x: _, y: _ } = event.event_type
@@ -1456,8 +1856,25 @@ fn main() {
                                 {
                                     set_selection_cursor(false);
                                     let _ = mouse_tx.try_send(HotkeyEvent::MouseReleased);
+                                } else if let EventType::KeyRelease(key) = event.event_type {
+                                    if matches!(key, RdevKey::ShiftLeft | RdevKey::ShiftRight) {
+                                        shift_pressed = false;
+                                    }
                                 } else if let EventType::KeyPress(key) = event.event_type {
-                                    if key == RdevKey::F10 {
+                                    if matches!(key, RdevKey::ShiftLeft | RdevKey::ShiftRight) {
+                                        shift_pressed = true;
+                                    }
+                                    if key == RdevKey::CapsLock {
+                                        caps_lock = !caps_lock;
+                                    }
+                                    if let Some(row_ix) = *keyboard_input_row.lock().unwrap() {
+                                        let _ = mouse_tx.try_send(HotkeyEvent::KeyboardInput(
+                                            row_ix,
+                                            keyboard_key_label(&key, shift_pressed ^ caps_lock),
+                                        ));
+                                        return;
+                                    }
+                                    if key == RdevKey::F8 {
                                         let _ = mouse_tx.try_send(HotkeyEvent::ToggleExecution);
                                         return;
                                     }
@@ -1535,6 +1952,22 @@ fn main() {
                                                     title,
                                                     OptCate::键盘,
                                                 );
+                                            }
+                                            HotkeyEvent::KeyboardInput(row_ix, value) => {
+                                                view.data_table.update(cx, |table, cx| {
+                                                    *table
+                                                        .delegate()
+                                                        .expected_keyboard_value
+                                                        .lock()
+                                                        .unwrap() = Some((row_ix, value.clone()));
+                                                    if let Some(input) =
+                                                        table.delegate().opt_type_inputs.get(row_ix)
+                                                    {
+                                                        input.update(cx, |input, cx| {
+                                                            input.set_value(&value, window, cx);
+                                                        });
+                                                    }
+                                                });
                                             }
                                             HotkeyEvent::ToggleExecution => {
                                                 view.toggle_execution(cx);
