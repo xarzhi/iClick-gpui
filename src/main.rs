@@ -1,4 +1,4 @@
-// #![windows_subsystem = "windows"]
+﻿// #![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -30,10 +30,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL,
-    SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW, SetCursorPos,
-    SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW, WM_CHAR, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
+    GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowTextW, IDC_CROSS,
+    LoadCursorW, OCR_NORMAL, SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW,
+    SetCursorPos, SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW, WM_CHAR,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
 };
 
 fn set_selection_cursor(crosshair: bool) {
@@ -314,7 +314,15 @@ impl MyTableDelegate {
                     });
                 } else if let InputEvent::Change = event {
                     if let Ok(value) = input.read(cx).value().parse::<usize>() {
-                        table.delegate_mut().data[new_row_ix].delay = value;
+                        let Some(row_ix) = table
+                            .delegate()
+                            .delay_inputs
+                            .iter()
+                            .position(|candidate| candidate == input)
+                        else {
+                            return;
+                        };
+                        table.delegate_mut().data[row_ix].delay = value;
                         cx.notify();
                     }
                 }
@@ -344,7 +352,15 @@ impl MyTableDelegate {
                     });
                 } else if let InputEvent::Change = event {
                     if let Ok(value) = input.read(cx).value().parse::<usize>() {
-                        table.delegate_mut().data[new_row_ix].execute_time = value;
+                        let Some(row_ix) = table
+                            .delegate()
+                            .execute_time_inputs
+                            .iter()
+                            .position(|candidate| candidate == input)
+                        else {
+                            return;
+                        };
+                        table.delegate_mut().data[row_ix].execute_time = value;
                         cx.notify();
                     }
                 }
@@ -373,22 +389,46 @@ impl MyTableDelegate {
                         input.update(cx, |state, cx| {
                             state.set_selected_range(0..length, cx);
                         });
-                        *table.delegate().focused_keyboard_row.lock().unwrap() = Some(new_row_ix);
+                        let Some(row_ix) = table
+                            .delegate()
+                            .opt_type_inputs
+                            .iter()
+                            .position(|candidate| candidate == input)
+                        else {
+                            return;
+                        };
+                        *table.delegate().focused_keyboard_row.lock().unwrap() = Some(row_ix);
                     }
                     InputEvent::Blur => {
+                        let Some(row_ix) = table
+                            .delegate()
+                            .opt_type_inputs
+                            .iter()
+                            .position(|candidate| candidate == input)
+                        else {
+                            return;
+                        };
                         let mut focused_row = table.delegate().focused_keyboard_row.lock().unwrap();
-                        if *focused_row == Some(new_row_ix) {
+                        if *focused_row == Some(row_ix) {
                             *focused_row = None;
                         }
                     }
                     InputEvent::Change => {
+                        let Some(row_ix) = table
+                            .delegate()
+                            .opt_type_inputs
+                            .iter()
+                            .position(|candidate| candidate == input)
+                        else {
+                            return;
+                        };
                         let expected_value = table
                             .delegate()
                             .expected_keyboard_value
                             .lock()
                             .unwrap()
                             .clone()
-                            .filter(|(row_ix, _)| *row_ix == new_row_ix)
+                            .filter(|(expected_row_ix, _)| *expected_row_ix == row_ix)
                             .map(|(_, value)| value);
                         let value =
                             expected_value.unwrap_or_else(|| input.read(cx).value().to_string());
@@ -397,7 +437,7 @@ impl MyTableDelegate {
                                 state.set_value(&value, _window, cx);
                             });
                         }
-                        table.delegate_mut().data[new_row_ix].opt_type = value;
+                        table.delegate_mut().data[row_ix].opt_type = value;
                         cx.notify();
                     }
                     _ => {}
@@ -423,12 +463,20 @@ impl MyTableDelegate {
             &opt_cate_select,
             window,
             move |table: &mut TableState<MyTableDelegate>,
-                  _select,
+                  select,
                   event: &SelectEvent<SearchableVec<OptCate>>,
                   _window,
                   cx: &mut Context<TableState<MyTableDelegate>>| {
                 if let SelectEvent::Confirm(Some(value)) = event {
-                    table.delegate_mut().data[new_row_ix].opt_cate = match value.as_ref() {
+                    let Some(row_ix) = table
+                        .delegate()
+                        .opt_cate_selects
+                        .iter()
+                        .position(|candidate| candidate == select)
+                    else {
+                        return;
+                    };
+                    table.delegate_mut().data[row_ix].opt_cate = match value.as_ref() {
                         "鼠标" => OptCate::鼠标,
                         "键盘" => OptCate::键盘,
                         _ => return,
@@ -601,6 +649,7 @@ impl TableDelegate for MyTableDelegate {
 }
 
 impl MyTableDelegate {
+    #[allow(unused_must_use)]
     fn remove_row(&mut self, row_ix: usize) {
         if row_ix >= self.data.len() {
             return;
@@ -612,10 +661,10 @@ impl MyTableDelegate {
         self.opt_type_inputs.remove(row_ix);
         self.opt_cate_selects.remove(row_ix);
         self.opt_type_selects.remove(row_ix);
-        self.delay_subscriptions.remove(row_ix);
-        self.execute_time_subscriptions.remove(row_ix);
-        self.opt_cate_subscriptions.remove(row_ix);
-        self.opt_type_subscriptions.remove(row_ix);
+        let _ = self.delay_subscriptions.remove(row_ix);
+        let _ = self.execute_time_subscriptions.remove(row_ix);
+        let _ = self.opt_cate_subscriptions.remove(row_ix);
+        let _ = self.opt_type_subscriptions.remove(row_ix);
 
         let mut focused_row = self.focused_keyboard_row.lock().unwrap();
         if *focused_row == Some(row_ix) {
@@ -972,7 +1021,15 @@ fn keyboard_virtual_key(value: &str) -> Option<usize> {
     }
 }
 
-fn send_input_key(key: &str) {
+fn send_input_key(hwnd: HWND, key: &str) {
+    unsafe {
+        let top_level = GetAncestor(hwnd, GA_ROOT);
+        let _ = SetForegroundWindow(if top_level.0.is_null() {
+            hwnd
+        } else {
+            top_level
+        });
+    }
     let is_character = key.chars().count() == 1;
     let inputs = if !is_character {
         let Some(vk) = keyboard_virtual_key(key) else {
@@ -1099,7 +1156,7 @@ fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool) {
             }
             OptCate::键盘 => {
                 if front_opt {
-                    send_input_key(&row.opt_type);
+                    send_input_key(hwnd, &row.opt_type);
                 } else if row.opt_type.chars().count() == 1 {
                     for unit in row.opt_type.encode_utf16() {
                         let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
@@ -1112,6 +1169,9 @@ fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool) {
                         wparam,
                         keyboard_message_lparam(key, false),
                     );
+                    if key == 0x0D {
+                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(0x0D), LPARAM(0));
+                    }
                     let _ =
                         SendMessageW(hwnd, WM_KEYUP, wparam, keyboard_message_lparam(key, true));
                 } else {
