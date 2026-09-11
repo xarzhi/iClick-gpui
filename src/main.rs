@@ -1,4 +1,4 @@
-﻿// #![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -1651,7 +1651,7 @@ impl Render for IClick {
                                                                     .child("操作间隔："),
                                                             )
                                                             .child(div().w(px(80.0)).child(
-                                                                Input::new(&self.opt_gap_ipt).small().suffix(div().child("ms")),
+                                                                Input::new(&self.opt_gap_ipt).small().suffix(div().child("ms"))
                                                             )),
                                                     )
                                                     .child(
