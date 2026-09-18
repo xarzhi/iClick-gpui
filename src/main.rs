@@ -66,9 +66,19 @@ const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
 ];
 
 /// 配置文件格式版本：以后结构变了可以按版本兼容。
-const CONFIG_VERSION: u32 = 1;
+/// 1 → 2：操作列表从一份变成多方案（v1 的老配置读进来就是「方案一」）。
+const CONFIG_VERSION: u32 = 2;
 
-/// 保存/读取的配置文件内容：程序里的所有配置 + 表格里的每一行。
+/// 配置文件里存的一个方案。
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+struct SchemeConfig {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    rows: Vec<RowConfig>,
+}
+
+/// 保存/读取的配置文件内容：程序里的所有配置 + 每个方案的操作列表。
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct ConfigFile {
     /// 必填：没有这个字段就说明不是本程序的配置文件。
@@ -81,6 +91,13 @@ struct ConfigFile {
     opt_two: OptTwoConfig,
     #[serde(default)]
     hotkeys: HotkeyConfig,
+    /// 所有方案（方案一…方案五）。
+    #[serde(default)]
+    schemes: Vec<SchemeConfig>,
+    /// 保存时正处于哪个方案，读回来还切到那一个。
+    #[serde(default)]
+    active_scheme: usize,
+    /// 当前方案的操作列表。老版本配置只有这一个字段，读的时候当成唯一的方案一。
     #[serde(default)]
     rows: Vec<RowConfig>,
 }
@@ -204,7 +221,7 @@ fn default_execute_time() -> usize {
 }
 
 impl ConfigFile {
-    /// 校验读进来的内容：版本对不对、每一行的数据说不说得通。
+    /// 校验读进来的内容：版本对不对、方案个数、每一行的数据说不说得通。
     /// 只要有一处不对就报错，界面上原来的东西一点不动。
     fn validate(&self) -> Result<(), String> {
         if self.version == 0 || self.version > CONFIG_VERSION {
@@ -213,31 +230,58 @@ impl ConfigFile {
                 self.version, CONFIG_VERSION
             ));
         }
-        for (index, row) in self.rows.iter().enumerate() {
-            let line = index + 1;
-            match row.opt_cate.as_str() {
-                "鼠标" => {
-                    if MouseOptType::from_label(&row.opt_type).is_none() {
-                        return Err(format!(
-                            "第 {line} 行的操作方式「{}」不是有效的鼠标操作",
-                            row.opt_type
-                        ));
-                    }
-                }
-                "键盘" => {
-                    if row.opt_type.trim().is_empty() {
-                        return Err(format!("第 {line} 行是键盘操作，但没写按键"));
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "第 {line} 行的操作类型「{other}」只能是「鼠标」或「键盘」"
-                    ));
-                }
+        if self.schemes.len() > MAX_SCHEMES {
+            return Err(format!(
+                "配置里有 {} 个方案，最多只支持 {MAX_SCHEMES} 个",
+                self.schemes.len()
+            ));
+        }
+        if self.schemes.is_empty() {
+            validate_rows(&self.rows, "")?;
+        } else {
+            for (index, scheme) in self.schemes.iter().enumerate() {
+                let name = if scheme.name.trim().is_empty() {
+                    SCHEME_NAMES
+                        .get(index)
+                        .copied()
+                        .unwrap_or("方案")
+                        .to_string()
+                } else {
+                    scheme.name.clone()
+                };
+                validate_rows(&scheme.rows, &format!("「{name}」"))?;
             }
         }
         Ok(())
     }
+}
+
+/// 校验一批操作行；prefix 用来在报错里指出是哪个方案。
+fn validate_rows(rows: &[RowConfig], prefix: &str) -> Result<(), String> {
+    for (index, row) in rows.iter().enumerate() {
+        let line = index + 1;
+        match row.opt_cate.as_str() {
+            "鼠标" => {
+                if MouseOptType::from_label(&row.opt_type).is_none() {
+                    return Err(format!(
+                        "{prefix}第 {line} 行的操作方式「{}」不是有效的鼠标操作",
+                        row.opt_type
+                    ));
+                }
+            }
+            "键盘" => {
+                if row.opt_type.trim().is_empty() {
+                    return Err(format!("{prefix}第 {line} 行是键盘操作，但没写按键"));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{prefix}第 {line} 行的操作类型「{other}」只能是「鼠标」或「键盘」"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 本机当前日期，用来拼配置文件名：iclick_config_2025_09_18.json。
@@ -413,6 +457,72 @@ fn parse_config(text: &str) -> Result<ConfigFile, String> {
         .map_err(|error| format!("不是本程序的配置文件：{error}"))?;
     config.validate()?;
     Ok(config)
+}
+
+/// 配置里的方案 → 界面用的方案列表。
+/// 新配置带 schemes 就用它；老配置只有 rows，那就当成唯一的「方案一」。
+fn schemes_of(config: &ConfigFile) -> Vec<Scheme> {
+    let mut schemes: Vec<Scheme> = if config.schemes.is_empty() {
+        vec![Scheme {
+            name: SCHEME_NAMES[0].to_string(),
+            rows: config.rows.iter().map(my_data_of).collect(),
+        }]
+    } else {
+        config
+            .schemes
+            .iter()
+            .enumerate()
+            .map(|(index, scheme)| Scheme {
+                name: if scheme.name.trim().is_empty() {
+                    SCHEME_NAMES
+                        .get(index)
+                        .copied()
+                        .unwrap_or("方案")
+                        .to_string()
+                } else {
+                    scheme.name.clone()
+                },
+                rows: scheme.rows.iter().map(my_data_of).collect(),
+            })
+            .collect()
+    };
+    schemes.truncate(MAX_SCHEMES);
+    schemes
+}
+
+/// 把配置里的一行还原成表格数据。
+fn my_data_of(row: &RowConfig) -> MyData {
+    MyData {
+        x: row.x,
+        y: row.y,
+        win_hwnd: row.win_hwnd.clone(),
+        opt_cate: if row.opt_cate == "键盘" {
+            OptCate::键盘
+        } else {
+            OptCate::鼠标
+        },
+        opt_type: row.opt_type.clone(),
+        win_title: row.win_title.clone(),
+        delay: row.delay,
+        execute_time: row.execute_time.max(1),
+    }
+}
+
+/// 把一行表格数据转成配置里的样子。
+fn row_config_of(row: &MyData) -> RowConfig {
+    RowConfig {
+        x: row.x,
+        y: row.y,
+        win_hwnd: row.win_hwnd.clone(),
+        opt_cate: match row.opt_cate {
+            OptCate::鼠标 => "鼠标".to_string(),
+            OptCate::键盘 => "键盘".to_string(),
+        },
+        opt_type: row.opt_type.clone(),
+        win_title: row.win_title.clone(),
+        delay: row.delay,
+        execute_time: row.execute_time,
+    }
 }
 
 /// 把配置写成 json 文件。
@@ -1265,8 +1375,25 @@ impl SelectItem for OptCate {
     }
 }
 
+/// 最多能有几个方案。
+const MAX_SCHEMES: usize = 5;
+
+/// 方案名按顺序取：方案一 … 方案五。
+const SCHEME_NAMES: [&str; MAX_SCHEMES] = ["方案一", "方案二", "方案三", "方案四", "方案五"];
+
+/// 一个方案：名字 + 它自己的一份操作列表（每个方案就是一个独立的表格）。
+#[derive(Clone, Debug)]
+struct Scheme {
+    name: String,
+    rows: Vec<MyData>,
+}
+
 struct MyTableDelegate {
     data: Vec<MyData>,
+    /// 所有方案。第 active_scheme 个方案的内容就是上面的 data，
+    /// 其余方案的表格内容先寄存在这里（切换方案时来回搬）。
+    schemes: Vec<Scheme>,
+    active_scheme: usize,
     columns: Vec<Column>,
     delay_inputs: Vec<Entity<InputState>>,
     execute_time_inputs: Vec<Entity<InputState>>,
@@ -1303,6 +1430,11 @@ impl MyTableDelegate {
 
         Self {
             data,
+            schemes: vec![Scheme {
+                name: SCHEME_NAMES[0].to_string(),
+                rows: Vec::new(),
+            }],
+            active_scheme: 0,
             columns: vec![
                 Column::new("x", "X").width(40.),
                 Column::new("y", "Y").width(40.),
@@ -1746,7 +1878,7 @@ impl TableDelegate for MyTableDelegate {
 }
 
 impl MyTableDelegate {
-    /// 清空所有行（读取配置时用），跟着行一起建的输入框、下拉框和订阅也一起丢掉。
+    /// 清空所有行（读取配置、切方案时用），跟着行一起建的输入框、下拉框和订阅也一起丢掉。
     fn clear_rows(&mut self) {
         self.data.clear();
         self.delay_inputs.clear();
@@ -1761,6 +1893,73 @@ impl MyTableDelegate {
         self.opt_type_select_subscriptions.clear();
         *self.focused_keyboard_row.lock().unwrap() = None;
         *self.expected_keyboard_value.lock().unwrap() = None;
+    }
+
+    /// 把当前正在编辑的表格内容存回它所属的方案。
+    fn stash_active_scheme(&mut self) {
+        if let Some(scheme) = self.schemes.get_mut(self.active_scheme) {
+            scheme.rows = self.data.clone();
+        }
+    }
+
+    /// 上面那排 tab 要显示的名字。
+    fn scheme_names(&self) -> Vec<SharedString> {
+        self.schemes
+            .iter()
+            .map(|scheme| SharedString::from(scheme.name.clone()))
+            .collect()
+    }
+
+    /// 当前是第几个方案。
+    fn active_scheme(&self) -> usize {
+        self.active_scheme
+    }
+
+    /// 切换方案：先把当前方案的内容存回去，再把目标方案的行重新铺到表格里。
+    fn switch_scheme(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        if index == self.active_scheme || index >= self.schemes.len() {
+            return;
+        }
+        self.stash_active_scheme();
+        self.active_scheme = index;
+        let rows = self.schemes[index].rows.clone();
+        self.clear_rows();
+        for row in rows {
+            self.add_row(window, cx, row);
+        }
+    }
+
+    /// 新增一个方案并切过去；已经到上限就返回 false。
+    fn add_scheme(&mut self, window: &mut Window, cx: &mut Context<TableState<Self>>) -> bool {
+        if self.schemes.len() >= MAX_SCHEMES {
+            return false;
+        }
+        self.stash_active_scheme();
+        let name = SCHEME_NAMES[self.schemes.len().min(MAX_SCHEMES - 1)].to_string();
+        self.schemes.push(Scheme {
+            name,
+            rows: Vec::new(),
+        });
+        self.active_scheme = self.schemes.len() - 1;
+        // 新方案是空的，把表格清干净就是切过去了。
+        self.clear_rows();
+        let _ = (window, cx);
+        true
+    }
+
+    /// 清空当前方案的所有行；返回清掉的行数。
+    fn clear_active_scheme(&mut self, _window: &mut Window, _cx: &mut Context<TableState<Self>>) -> usize {
+        let removed = self.data.len();
+        self.clear_rows();
+        if let Some(scheme) = self.schemes.get_mut(self.active_scheme) {
+            scheme.rows.clear();
+        }
+        removed
     }
 
     /// 录制时把刚记下的那一次点击并成双击：只有最后一行正好是同一次单击（同样的键、
@@ -2147,29 +2346,31 @@ impl IClick {
         cx.notify();
     }
 
-    /// 把界面上所有配置和表格内容收集成一份配置。
-    fn collect_config(&self, cx: &App) -> ConfigFile {
+    /// 把界面上所有配置和每个方案的操作列表收集成一份配置。
+    fn collect_config(&mut self, cx: &mut Context<Self>) -> ConfigFile {
+        // 先把正在编辑的内容存回它所属的方案，免得漏掉刚敲进去的字。
+        self.data_table
+            .update(cx, |table, _cx| table.delegate_mut().stash_active_scheme());
         let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
-        let rows = self
-            .data_table
-            .read(cx)
-            .delegate()
-            .data
-            .iter()
-            .map(|row| RowConfig {
-                x: row.x,
-                y: row.y,
-                win_hwnd: row.win_hwnd.clone(),
-                opt_cate: match row.opt_cate {
-                    OptCate::鼠标 => "鼠标".to_string(),
-                    OptCate::键盘 => "键盘".to_string(),
-                },
-                opt_type: row.opt_type.clone(),
-                win_title: row.win_title.clone(),
-                delay: row.delay,
-                execute_time: row.execute_time,
-            })
-            .collect();
+        let (schemes, active_scheme) = {
+            let delegate = self.data_table.read(cx).delegate();
+            (
+                delegate
+                    .schemes
+                    .iter()
+                    .map(|scheme| SchemeConfig {
+                        name: scheme.name.clone(),
+                        rows: scheme.rows.iter().map(row_config_of).collect(),
+                    })
+                    .collect::<Vec<_>>(),
+                delegate.active_scheme,
+            )
+        };
+        // rows 留一份当前方案的，老版本程序也能读这份配置。
+        let rows = schemes
+            .get(active_scheme)
+            .map(|scheme| scheme.rows.clone())
+            .unwrap_or_default();
 
         ConfigFile {
             version: CONFIG_VERSION,
@@ -2195,6 +2396,8 @@ impl IClick {
                 click_count: text(&self.click_count_input),
             },
             hotkeys: HotkeyConfig::from(&*lock_hotkeys(&self.hotkeys)),
+            schemes,
+            active_scheme,
             rows,
         }
     }
@@ -2224,6 +2427,9 @@ impl IClick {
 
     /// 把配置套用到界面：勾选、下拉、输入框、快捷键，以及整张表格。
     fn apply_config(&mut self, window: &mut Window, cx: &mut Context<Self>, config: ConfigFile) {
+        // 先按整份配置把方案算出来，下面再把各字段搬进界面。
+        let schemes = schemes_of(&config);
+        let active_scheme = config.active_scheme.min(schemes.len().saturating_sub(1));
         let opt_one = config.opt_one;
         self.always_on_top = opt_one.always_on_top;
         self.front_opt = opt_one.front_opt;
@@ -2250,32 +2456,56 @@ impl IClick {
             input.update(cx, |input, cx| input.set_value(&value, window, cx));
         }
 
-        *lock_hotkeys(&self.hotkeys) = HotkeySettings::from(config.hotkeys);
+        let hotkeys = HotkeySettings::from(config.hotkeys.clone());
+        *lock_hotkeys(&self.hotkeys) = hotkeys;
 
-        let rows = config.rows;
         self.data_table.update(cx, |table, cx| {
             let delegate = table.delegate_mut();
             delegate.clear_rows();
+            delegate.schemes = schemes;
+            delegate.active_scheme = active_scheme;
+            let rows = delegate.schemes[active_scheme].rows.clone();
             for row in rows {
-                let opt_cate = if row.opt_cate == "键盘" {
-                    OptCate::键盘
-                } else {
-                    OptCate::鼠标
-                };
-                let data = MyData {
-                    x: row.x,
-                    y: row.y,
-                    win_hwnd: row.win_hwnd,
-                    opt_cate,
-                    opt_type: row.opt_type,
-                    win_title: row.win_title,
-                    delay: row.delay,
-                    execute_time: row.execute_time.max(1),
-                };
-                delegate.add_row(window, cx, data);
+                delegate.add_row(window, cx, row);
             }
         });
         cx.notify();
+    }
+
+    /// 上面那排方案 tab 被点了：切到对应方案。
+    fn switch_scheme(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.data_table
+            .update(cx, |table, cx| table.delegate_mut().switch_scheme(index, window, cx));
+        cx.notify();
+    }
+
+    /// 「添加方案」：加一个空方案并切过去，最多 MAX_SCHEMES 个。
+    fn add_scheme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let added = self
+            .data_table
+            .update(cx, |table, cx| table.delegate_mut().add_scheme(window, cx));
+        if added {
+            let count = self.data_table.read(cx).delegate().schemes.len();
+            self.set_config_status(format!("已添加方案（共 {count} 个，最多 {MAX_SCHEMES} 个）"), false, cx);
+        } else {
+            self.set_config_status(format!("最多只能有 {MAX_SCHEMES} 个方案"), true, cx);
+        }
+    }
+
+    /// 「清空列表」：把当前方案的操作全部清掉。
+    fn clear_scheme_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let removed = self
+            .data_table
+            .update(cx, |table, cx| table.delegate_mut().clear_active_scheme(window, cx));
+        let name = {
+            let delegate = self.data_table.read(cx).delegate();
+            delegate
+                .schemes
+                .get(delegate.active_scheme)
+                .map(|scheme| scheme.name.clone())
+                .unwrap_or_default()
+        };
+        self.set_config_status(format!("已清空「{name}」的 {removed} 行"), false, cx);
     }
 
     /// 操作二的开始/停止：在当前鼠标位置连点，次数用完自己停，
@@ -3915,8 +4145,63 @@ impl Render for IClick {
 						)
 					)
                     .child({
+                        // 方案 tab（左） + 添加方案 / 清空列表（右），然后下面才是表格。
+                        let scheme_names = self.data_table.read(cx).delegate().scheme_names();
+                        let active_scheme = self.data_table.read(cx).delegate().active_scheme();
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .flex_shrink_0()
+                            .mt(px(8.0))
+                            .mb(px(6.0))
+                            .child(
+                                TabBar::new("scheme_tabs")
+                                    .small()
+                                    .text_size(px(12.0))
+                                    .selected_index(active_scheme)
+                                    .segmented()
+                                    .on_click(cx.listener(|this, index, window, cx| {
+                                        this.switch_scheme(*index, window, cx);
+                                    }))
+                                    .children(scheme_names.into_iter().map(|name| {
+                                        Tab::new()
+                                            .label(name)
+                                            .text_size(px(12.0))
+                                            .cursor(CursorStyle::PointingHand)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        Button::new("add_scheme_btn")
+                                            .label("添加方案")
+                                            .small()
+                                            .text_size(px(12.0))
+                                            .mr(px(8.0))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.add_scheme(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("clear_rows_btn")
+                                            .label("清空列表")
+                                            .small()
+                                            .text_size(px(12.0))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.clear_scheme_rows(window, cx);
+                                            })),
+                                    ),
+                            )
+                    })
+                    .child({
                         // 读取/保存的结果显示在表格上方，一眼能看到文件到底存哪了。
-                        let mut area = div().w_full().h(px(200.0)).flex().flex_col();
+                        let mut area = div().w_full().h(px(168.0)).flex().flex_col();
                         if let Some(status) = self.config_status.clone() {
                             area = area.child(
                                 div()
@@ -4633,16 +4918,16 @@ mod double_click_tests {
     // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
     use super::{
         CONFIG_VERSION, ConfigFile, Duration, HWND, HotkeyAction, HotkeyConfig, HotkeySettings,
-        Instant, KeyAction, LPARAM, LEFT_DOUBLE_CLICK_LABEL, MOUSE_MOVE_LABEL,
+        Instant, KeyAction, LPARAM, LEFT_DOUBLE_CLICK_LABEL, MAX_SCHEMES, MOUSE_MOVE_LABEL,
         MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
-        OptCate, OptOneConfig, OptTwoConfig, RowConfig, SendMessageW, WPARAM, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, class_accepts_double_click, config_file_stem, config_save_path,
-        double_click_gap, double_click_time_ms, fuzzy_point, hotkey_key_label, hotkey_keystroke,
-        is_double_click, is_left_double_click, keeps_clicking, keyboard_row_label, parse_config,
-        plain_key_label, random_seed, recorded_double_opt_type, recorded_key_label,
-        recorded_mouse_opt_type, send_message_mouse, should_record_move, sleep_until_stopped,
-        split_key_action, split_keyboard_combo, take_recorded_delay, waits_between_loops,
-        write_config_file,
+        OptCate, OptOneConfig, OptTwoConfig, RowConfig, SchemeConfig, SendMessageW, WPARAM,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click, config_file_stem,
+        config_save_path, double_click_gap, double_click_time_ms, fuzzy_point, hotkey_key_label,
+        hotkey_keystroke, is_double_click, is_left_double_click, keeps_clicking,
+        keyboard_row_label, parse_config, plain_key_label, random_seed, recorded_double_opt_type,
+        recorded_key_label, recorded_mouse_opt_type, schemes_of, send_message_mouse,
+        should_record_move, sleep_until_stopped, split_key_action, split_keyboard_combo,
+        take_recorded_delay, waits_between_loops, write_config_file,
     };
     use rdev::{Button as RdevButton, Key as RdevKey};
     use std::sync::Arc;
@@ -4709,6 +4994,11 @@ mod double_click_tests {
     fn recorded_delegate(data: Vec<MyData>) -> MyTableDelegate {
         MyTableDelegate {
             data,
+            schemes: vec![super::Scheme {
+                name: super::SCHEME_NAMES[0].to_string(),
+                rows: Vec::new(),
+            }],
+            active_scheme: 0,
             columns: Vec::new(),
             delay_inputs: Vec::new(),
             execute_time_inputs: Vec::new(),
@@ -5101,6 +5391,8 @@ mod double_click_tests {
                 keyboard_event: "F7".to_string(),
                 opt_two_run: "F9".to_string(),
             },
+            schemes: Vec::new(),
+            active_scheme: 0,
             rows: vec![
                 RowConfig {
                     x: 100,
@@ -5230,6 +5522,8 @@ mod double_click_tests {
                 click_count: "6".to_string(),
             },
             hotkeys: HotkeyConfig::default(),
+            schemes: Vec::new(),
+            active_scheme: 0,
             rows: vec![RowConfig {
                 x: 5,
                 y: 6,
@@ -5270,6 +5564,91 @@ mod double_click_tests {
             parse_config(r#"{"version":1,"rows":[]}"#).is_ok(),
             "空表格的配置是合法的"
         );
+    }
+
+    /// 多方案：配置里存了三个方案就读出三个，老配置（只有 rows）当成唯一的方案一。
+    #[test]
+    fn schemes_survive_saving_and_loading() {
+        let scheme = |name: &str, x: usize| SchemeConfig {
+            name: name.to_string(),
+            rows: vec![RowConfig {
+                x,
+                y: x,
+                win_hwnd: "0x1".to_string(),
+                opt_cate: "鼠标".to_string(),
+                opt_type: "左键单击".to_string(),
+                win_title: None,
+                delay: 10,
+                execute_time: 1,
+            }],
+        };
+        let config = ConfigFile {
+            version: CONFIG_VERSION,
+            saved_at: String::new(),
+            opt_one: OptOneConfig::default(),
+            opt_two: OptTwoConfig::default(),
+            hotkeys: HotkeyConfig::default(),
+            schemes: vec![scheme("方案一", 1), scheme("方案二", 2), scheme("方案三", 3)],
+            active_scheme: 2,
+            rows: vec![],
+        };
+        config.validate().expect("三个方案是合法的");
+
+        let json = serde_json::to_string_pretty(&config).expect("能序列化");
+        let restored = parse_config(&json).expect("能读回来");
+        assert_eq!(restored.schemes.len(), 3);
+        assert_eq!(restored.active_scheme, 2);
+
+        let schemes = schemes_of(&restored);
+        assert_eq!(schemes.len(), 3);
+        assert_eq!(schemes[0].name, "方案一");
+        assert_eq!(schemes[2].name, "方案三");
+        assert_eq!(schemes[1].rows[0].x, 2, "每个方案的表格内容各归各的");
+
+        // 老配置：没有 schemes 字段，只有一份 rows。
+        let old: ConfigFile = parse_config(
+            r#"{"version":1,"rows":[{"x":9,"y":9,"win_hwnd":"0x1","opt_cate":"鼠标","opt_type":"左键单击"}]}"#,
+        )
+        .expect("老配置能读");
+        let schemes = schemes_of(&old);
+        assert_eq!(schemes.len(), 1, "老配置就是方案一");
+        assert_eq!(schemes[0].name, "方案一");
+        assert_eq!(schemes[0].rows[0].x, 9);
+
+        // 方案名空着就按顺序补，超过 5 个方案要报错。
+        let unnamed: ConfigFile = parse_config(
+            r#"{"version":2,"schemes":[{"rows":[]},{"rows":[]}]}"#,
+        )
+        .expect("能解析");
+        let schemes = schemes_of(&unnamed);
+        assert_eq!(schemes[0].name, "方案一");
+        assert_eq!(schemes[1].name, "方案二");
+
+        let too_many = ConfigFile {
+            version: CONFIG_VERSION,
+            saved_at: String::new(),
+            opt_one: OptOneConfig::default(),
+            opt_two: OptTwoConfig::default(),
+            hotkeys: HotkeyConfig::default(),
+            schemes: (0..MAX_SCHEMES + 1)
+                .map(|index| SchemeConfig {
+                    name: String::new(),
+                    rows: vec![],
+                })
+                .collect(),
+            active_scheme: 0,
+            rows: vec![],
+        };
+        assert!(too_many.validate().is_err(), "最多 5 个方案");
+
+        // 某个方案里的行不合法，报错里要指明是哪个方案。
+        // 这里用 serde 直接解析（parse_config 会顺手校验，拿不到错误文案）。
+        let bad_row: ConfigFile = serde_json::from_str(
+            r#"{"version":2,"schemes":[{"name":"方案二","rows":[{"x":1,"y":2,"opt_cate":"鼠标","opt_type":"瞎写"}]}]}"#,
+        )
+        .expect("能解析");
+        let error = bad_row.validate().expect_err("应当报错");
+        assert!(error.contains("方案二"), "报错要指明方案：{error}");
     }
 
     /// 修饰键自己不成一次操作，只用来拼组合键。
