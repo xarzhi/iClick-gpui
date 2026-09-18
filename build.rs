@@ -4,6 +4,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 就会直接“thread 'main' has overflowed its stack”。这里把主线程栈加大到 8MB。
     println!("cargo:rustc-link-arg-bins=/STACK:8388608");
 
+    // 体积：合并内容完全相同的函数体（release 下有效，配合 LTO 一起用）。
+    println!("cargo:rustc-link-arg-bins=/OPT:ICF");
+
     winres::WindowsResource::new()
         .set_icon("icon.ico")
         .compile()?;
