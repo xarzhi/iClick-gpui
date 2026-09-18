@@ -576,6 +576,91 @@ fn component_size_for_12px() -> Pixels {
     px(12.0 / 0.875)
 }
 
+/// 模糊点击用的随机种子：每次开始执行取一个，够随机就行，不追求密码学强度。
+fn random_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    // 保证不为 0，xorshift 的种子全是 0 时会一直输出 0。
+    nanos ^ std::process::id() as u64 | 1
+}
+
+/// xorshift64*：状态小、够快，模糊点击只要点位别老是同一个。
+fn next_random(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    value.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// 模糊点击：以 (x, y) 为中心，在 ±range 内各取一个随机点。
+/// 比如范围 5、坐标 (100, 100)，取到的就是 x 95~105、y 95~105（不会取到负数）。
+/// range 为 0 时原样返回，也就是不模糊。
+fn fuzzy_point(x: usize, y: usize, range: usize, state: &mut u64) -> (usize, usize) {
+    if range == 0 {
+        return (x, y);
+    }
+    let span = range as u64 * 2 + 1;
+    let offset_x = (next_random(state) % span) as i64 - range as i64;
+    let offset_y = (next_random(state) % span) as i64 - range as i64;
+    (
+        (x as i64 + offset_x).max(0) as usize,
+        (y as i64 + offset_y).max(0) as usize,
+    )
+}
+
+/// 一轮操作走完之后要不要等“循环间隔”：只在还有下一轮的时候等，
+/// 最后一轮结束后不用再空等一次（循环次数 0 表示无限循环，每轮之间都要等）。
+fn waits_between_loops(loop_count: usize, completed_loops: usize) -> bool {
+    loop_count == 0 || completed_loops < loop_count
+}
+
+/// 分片等待：中途被暂停（execution_flag 清零）就立刻返回 false，
+/// 不会因为「循环间隔」填得很大而让暂停按钮像失灵一样。
+fn sleep_until_stopped(execution_flag: &Arc<AtomicBool>, duration: Duration) -> bool {
+    const SLICE: Duration = Duration::from_millis(20);
+    let mut slept = Duration::ZERO;
+    while slept < duration {
+        if !execution_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        let chunk = SLICE.min(duration - slept);
+        thread::sleep(chunk);
+        slept += chunk;
+    }
+    execution_flag.load(Ordering::Acquire)
+}
+
+/// 「操作间隔」的记账：每个操作开始前都要等这么久，
+/// 但整场执行的第一个操作不用等（否则一按开始就白等一轮）。
+struct OperationGap {
+    /// 第一个操作是不是已经做过了。
+    started: bool,
+    gap_ms: usize,
+}
+
+impl OperationGap {
+    fn new(gap_ms: usize) -> Self {
+        Self {
+            started: false,
+            gap_ms,
+        }
+    }
+
+    /// 取这一次操作开始前要等多少毫秒。
+    fn wait_before_operation(&mut self) -> usize {
+        if self.started {
+            self.gap_ms
+        } else {
+            self.started = true;
+            0
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 
 struct MyData {
@@ -1176,6 +1261,31 @@ impl IClick {
             .value()
             .parse::<usize>()
             .unwrap_or(1);
+        // 循环间隔：一轮表格走完之后，等这么久再开始下一轮。
+        let loop_gap = self
+            .loop_gap_ipt
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(0);
+        // 操作间隔：每个操作做完之后，隔这么久才做下一个（跨行、跨轮都算）。
+        let opt_gap = self
+            .opt_gap_ipt
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(0);
+        // 模糊点击：每次点击都在行坐标 ±模糊范围 内随机取点。
+        let fuzzy_click = self.fuzzy_click;
+        let fuzzy_range = if fuzzy_click {
+            self.fuzzy_round_input
+                .read(cx)
+                .value()
+                .parse::<usize>()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let front_opt = self.front_opt;
 
         self.is_running = true;
@@ -1184,6 +1294,9 @@ impl IClick {
         let execution_event_tx = self.execution_event_tx.clone();
         thread::spawn(move || {
             let mut completed_loops = 0;
+            // 每个执行线程自己一份随机种子，模糊点击用它取点位。
+            let mut random_seed = random_seed();
+            let mut operation_gap = OperationGap::new(opt_gap);
             while loop_count == 0 || completed_loops < loop_count {
                 for row in &rows {
                     if !execution_flag.load(Ordering::Acquire) {
@@ -1198,9 +1311,28 @@ impl IClick {
                             break;
                         }
 
-                        send_row_input(hwnd, row, front_opt);
-                        if row.delay > 0 {
-                            thread::sleep(Duration::from_millis(row.delay as u64));
+                        // 操作间隔：上一个操作和这一个之间的间隔。
+                        let wait = operation_gap.wait_before_operation();
+                        if wait > 0
+                            && !sleep_until_stopped(
+                                &execution_flag,
+                                Duration::from_millis(wait as u64),
+                            )
+                        {
+                            break;
+                        }
+
+                        // 一次点击取一个点：双击的两次点按共用它，否则就不是双击了。
+                        let point = fuzzy_point(row.x, row.y, fuzzy_range, &mut random_seed);
+                        send_row_input(hwnd, row, front_opt, point);
+                        // 行自己的延迟照旧，跟在这次操作后面。
+                        if row.delay > 0
+                            && !sleep_until_stopped(
+                                &execution_flag,
+                                Duration::from_millis(row.delay as u64),
+                            )
+                        {
+                            break;
                         }
                     }
                 }
@@ -1208,6 +1340,12 @@ impl IClick {
                     break;
                 }
                 completed_loops += 1;
+                if waits_between_loops(loop_count, completed_loops)
+                    && loop_gap > 0
+                    && !sleep_until_stopped(&execution_flag, Duration::from_millis(loop_gap as u64))
+                {
+                    break;
+                }
             }
             execution_flag.store(false, Ordering::Release);
             let _ = execution_event_tx.try_send(HotkeyEvent::ExecutionFinished);
@@ -1870,15 +2008,15 @@ fn send_input_wheel(delta: i32) {
 /// 双击就注入两组“按下/抬起”：SendInput 走的是系统输入队列，
 /// 第二组会被系统自身的双击判定识别，并自动合成 WM_*BUTTONDBLCLK，
 /// 所以这里不需要（也不应该）自己补发那条消息。
-fn send_input_mouse(hwnd: HWND, row: &MyData) {
+fn send_input_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
     unsafe {
-        let mut point = POINT {
-            x: row.x as i32,
-            y: row.y as i32,
+        let mut cursor = POINT {
+            x: point.0 as i32,
+            y: point.1 as i32,
         };
-        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut cursor);
         let _ = SetForegroundWindow(hwnd);
-        let _ = SetCursorPos(point.x, point.y);
+        let _ = SetCursorPos(cursor.x, cursor.y);
     }
 
     // 认不出来的操作方式按左键单击处理，保证老数据也点得动。
@@ -1920,25 +2058,25 @@ fn class_accepts_double_click(hwnd: HWND) -> bool {
 /// 因此双击的消息序列要按窗口类样式自己补全：
 ///   带 CS_DBLCLKS 的类：DOWN → UP → DBLCLK → UP（第二次按下用 WM_*BUTTONDBLCLK 代替）
 ///   不带 CS_DBLCLKS 的类：真实双击对它就是两次普通按下，永远不会出现 DBLCLK 消息
-fn send_message_mouse(hwnd: HWND, row: &MyData) {
+fn send_message_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
     // 认不出来的操作方式按左键单击处理，保证老数据也点得动。
     let opt_type = MouseOptType::from_label(&row.opt_type).unwrap_or(MouseOptType::左键单击);
 
     // 滚轮消息的位置参数是屏幕坐标，和按键消息的客户区坐标不一样，单独发。
     match opt_type {
         MouseOptType::滚轮上滑 => {
-            send_message_wheel(hwnd, row, WHEEL_DELTA as i32);
+            send_message_wheel(hwnd, point, WHEEL_DELTA as i32);
             return;
         }
         MouseOptType::滚轮下滑 => {
-            send_message_wheel(hwnd, row, -(WHEEL_DELTA as i32));
+            send_message_wheel(hwnd, point, -(WHEEL_DELTA as i32));
             return;
         }
         _ => {}
     }
 
-    let x = (row.x as u32) & 0xffff;
-    let y = (row.y as u32) & 0xffff;
+    let x = (point.0 as u32) & 0xffff;
+    let y = (point.1 as u32) & 0xffff;
     let lparam = LPARAM(((y << 16) | x) as isize);
 
     // 三种按键各自的按下/抬起/双击消息，以及按下时 wParam 里的按钮标志。
@@ -1986,16 +2124,16 @@ fn send_message_mouse(hwnd: HWND, row: &MyData) {
 
 /// 后台发一次滚轮：WM_MOUSEWHEEL 的位置参数用屏幕坐标，
 /// 而滚动量放在 wParam 的高 16 位（向下滚是负值）。
-fn send_message_wheel(hwnd: HWND, row: &MyData, delta: i32) {
-    let mut point = POINT {
-        x: row.x as i32,
-        y: row.y as i32,
+fn send_message_wheel(hwnd: HWND, point: (usize, usize), delta: i32) {
+    let mut screen = POINT {
+        x: point.0 as i32,
+        y: point.1 as i32,
     };
     unsafe {
-        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut screen);
     }
-    let x = (point.x as u32) & 0xffff;
-    let y = (point.y as u32) & 0xffff;
+    let x = (screen.x as u32) & 0xffff;
+    let y = (screen.y as u32) & 0xffff;
     let lparam = LPARAM(((y << 16) | x) as isize);
     let wparam = ((delta as u32) & 0xffff) << 16;
     unsafe {
@@ -2019,14 +2157,14 @@ fn keyboard_message_lparam(vk: usize, key_up: bool) -> LPARAM {
     LPARAM(value)
 }
 
-fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool) {
+fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool, point: (usize, usize)) {
     unsafe {
         match row.opt_cate {
             OptCate::鼠标 => {
                 if front_opt {
-                    send_input_mouse(hwnd, row);
+                    send_input_mouse(hwnd, row, point);
                 } else {
-                    send_message_mouse(hwnd, row);
+                    send_message_mouse(hwnd, row, point);
                 }
             }
             OptCate::键盘 => {
@@ -2130,6 +2268,8 @@ impl Render for IClick {
                                         GroupBox::new()
                                             .title("获取坐标方式一")
                                             .title_style(StyleRefinement::default().text_size(px(12.0)))
+                                            // GroupBox 默认标题和框之间隔着 16px，收窄一点。
+                                            .gap(px(4.0))
                                             .h(px(130.0))
                                             .mb(px(10.0))
                                             .child(
@@ -2241,6 +2381,8 @@ impl Render for IClick {
                                                     .text_size(px(12.0))
                                                     .h(px(20.0)),
                                             )
+                                            // 同上：标题贴近下面的框。
+                                            .gap(px(4.0))
                                             .h(px(110.0))
                                             .child(
                                                 div()
@@ -3301,13 +3443,16 @@ mod double_click_tests {
     // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
     use super::{
         Duration, HWND, HotkeySettings, Instant, LPARAM, LEFT_DOUBLE_CLICK_LABEL,
-        MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OptCate,
-        SendMessageW, WPARAM, WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click,
-        double_click_gap, double_click_time_ms, hotkey_key_label, hotkey_keystroke,
-        is_double_click, is_left_double_click, keyboard_row_label, recorded_double_opt_type,
-        recorded_mouse_opt_type, send_message_mouse, split_keyboard_combo,
+        MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
+        OptCate, SendMessageW, WPARAM, WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click,
+        double_click_gap, double_click_time_ms, fuzzy_point, hotkey_key_label, hotkey_keystroke,
+        is_double_click, is_left_double_click, keyboard_row_label, random_seed,
+        recorded_double_opt_type, recorded_mouse_opt_type, send_message_mouse,
+        sleep_until_stopped, split_keyboard_combo, waits_between_loops,
     };
     use rdev::{Button as RdevButton, Key as RdevKey};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::core::w;
     use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -3406,13 +3551,13 @@ mod double_click_tests {
         );
 
         // 左键单击：只移动插入符。
-        send_message_mouse(hwnd, &mouse_row("左键单击"));
+        send_message_mouse(hwnd, &mouse_row("左键单击"), (6, 10));
         let (click_start, click_end) = selection(hwnd);
         assert_eq!(click_start, click_end, "单击不应该选中任何文字");
 
         // 左键双击：选中光标下的整个单词。
         collapse_selection(hwnd);
-        send_message_mouse(hwnd, &mouse_row(LEFT_DOUBLE_CLICK_LABEL));
+        send_message_mouse(hwnd, &mouse_row(LEFT_DOUBLE_CLICK_LABEL), (6, 10));
         let (start, end) = selection(hwnd);
         assert!(end <= "hello world".len());
         // 只断言选中了光标下的那个词：合成的鼠标消息没有真实移动过光标，
@@ -3734,5 +3879,123 @@ mod double_click_tests {
         let mut delegate = recorded_delegate(vec![mouse_row("右键单击")]);
         assert!(delegate.upgrade_last_mouse_row(MouseOptType::右键双击, 7.0, 10.0));
         assert_eq!(delegate.data[0].opt_type, "右键双击");
+    }
+
+    /// 模糊点击：以行坐标为中心，在 ±模糊范围 里随机取点。
+    #[test]
+    fn fuzzy_point_stays_inside_the_range() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+
+        // 范围 0 就是不模糊，原样返回。
+        assert_eq!(fuzzy_point(100, 100, 0, &mut state), (100, 100));
+
+        // 范围 5、中心 (100, 100)：x、y 都落在 95~105，而且确实在变。
+        let mut seen_min = (usize::MAX, usize::MAX);
+        let mut seen_max = (0usize, 0usize);
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            let (x, y) = fuzzy_point(100, 100, 5, &mut state);
+            assert!((95..=105).contains(&x), "x={x} 超出了 95~105");
+            assert!((95..=105).contains(&y), "y={y} 超出了 95~105");
+            seen_min = (seen_min.0.min(x), seen_min.1.min(y));
+            seen_max = (seen_max.0.max(x), seen_max.1.max(y));
+            distinct.insert((x, y));
+        }
+        assert_eq!(seen_min, (95, 95), "范围下界应当取得到");
+        assert_eq!(seen_max, (105, 105), "范围上界应当取得到");
+        assert!(distinct.len() > 50, "点位要随机，不能老是同一个");
+
+        // 贴着左上角的行不会取到负坐标。
+        for _ in 0..200 {
+            let (x, y) = fuzzy_point(1, 0, 5, &mut state);
+            assert!(x <= 6);
+            assert!(y <= 5);
+        }
+
+        // 同一个种子给同一串点位，换个种子就换一串。
+        let mut a = 42u64;
+        let mut b = 42u64;
+        let mut c = 43u64;
+        let first: Vec<_> = (0..5).map(|_| fuzzy_point(100, 100, 5, &mut a)).collect();
+        let same: Vec<_> = (0..5).map(|_| fuzzy_point(100, 100, 5, &mut b)).collect();
+        let other: Vec<_> = (0..5).map(|_| fuzzy_point(100, 100, 5, &mut c)).collect();
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert_ne!(random_seed(), 0, "种子不能是 0");
+    }
+
+    /// 循环间隔只在“还有下一轮”的时候等，最后一轮结束不用空等。
+    #[test]
+    fn loop_gap_only_waits_between_rounds() {
+        // 循环 3 次：前两轮之后要等。
+        assert!(waits_between_loops(3, 1));
+        assert!(waits_between_loops(3, 2));
+        assert!(!waits_between_loops(3, 3), "最后一轮结束后不该再等");
+
+        // 只循环 1 次：根本没有下一轮。
+        assert!(!waits_between_loops(1, 1));
+
+        // 循环次数 0 表示无限次，每轮之间都要等。
+        assert!(waits_between_loops(0, 1));
+        assert!(waits_between_loops(0, 99));
+    }
+
+    /// 循环间隔期间点暂停，等待要立刻结束，而不是把整段间隔睡完。
+    #[test]
+    fn interruptible_wait_stops_early() {
+        let running = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        assert!(sleep_until_stopped(&running, Duration::from_millis(60)));
+        assert!(
+            start.elapsed() >= Duration::from_millis(50),
+            "正常运行时要等满间隔"
+        );
+
+        running.store(false, Ordering::Release);
+        let start = Instant::now();
+        assert!(!sleep_until_stopped(&running, Duration::from_millis(500)));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "暂停后不该继续等下去"
+        );
+    }
+
+    /// 操作间隔：第一个操作不等，之后每个操作前都要等；填 0 就完全不等待。
+    #[test]
+    fn operation_gap_skips_the_first_wait() {
+        let mut gap = OperationGap::new(20);
+        assert_eq!(gap.wait_before_operation(), 0, "整场执行的第一个操作不用等");
+        assert_eq!(gap.wait_before_operation(), 20);
+        assert_eq!(gap.wait_before_operation(), 20);
+
+        let mut none = OperationGap::new(0);
+        assert_eq!(none.wait_before_operation(), 0);
+        assert_eq!(none.wait_before_operation(), 0);
+    }
+
+    /// 传进去的点位要真的用在这一击上——模糊点击就是靠这个参数生效的。
+    #[test]
+    fn mouse_click_uses_the_given_point() {
+        let hwnd = create_edit();
+        unsafe {
+            let _ = SetWindowTextW(hwnd, w!("hello world"));
+        }
+
+        send_message_mouse(hwnd, &mouse_row("左键单击"), (2, 10));
+        let (near_start, near_end) = selection(hwnd);
+        assert_eq!(near_start, near_end, "单击不应该选中文字");
+
+        collapse_selection(hwnd);
+        send_message_mouse(hwnd, &mouse_row("左键单击"), (40, 10));
+        let (far_start, far_end) = selection(hwnd);
+        assert_eq!(far_start, far_end, "单击不应该选中文字");
+        assert!(
+            far_start > near_start,
+            "点位不同，插入符位置就该不同：{near_start} vs {far_start}"
+        );
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }
