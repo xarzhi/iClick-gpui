@@ -1,4 +1,4 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -9,7 +9,7 @@ use gpui_component::group_box::GroupBox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::radio::RadioGroup;
+use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
@@ -20,21 +20,32 @@ use rdev::{Button as RdevButton, Event, EventType, Key as RdevKey, listen};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::vec;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, MapVirtualKeyW,
-    SendInput, VIRTUAL_KEY,
+    GetDoubleClickTime, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    VkKeyScanW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowTextW, IDC_CROSS,
-    LoadCursorW, OCR_NORMAL, SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW,
-    SetCursorPos, SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW, WM_CHAR,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
+    CS_DBLCLKS, GA_ROOT, GCL_STYLE, GetAncestor, GetClassLongPtrW, GetCursorPos,
+    GetForegroundWindow, GetSystemMetrics, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL,
+    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW,
+    SetCursorPos, SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW,
+    WHEEL_DELTA, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WindowFromPoint,
 };
+
+/// 鼠标消息 wParam 里的“哪个键正按下”标志（winuser.h 的 MK_*），
+/// windows crate 只在 SystemServices 特性下导出，这里按消息格式自己写。
+const MK_LBUTTON: usize = 0x0001;
+const MK_RBUTTON: usize = 0x0002;
+const MK_MBUTTON: usize = 0x0010;
 
 fn set_selection_cursor(crosshair: bool) {
     unsafe {
@@ -94,6 +105,27 @@ enum HotkeyEvent {
     AddKeyboard(f64, f64, String, String),
     KeyboardInput(usize, String),
     ToggleExecution,
+    /// 开始/停止录制
+    ToggleRecording,
+    /// 修改快捷键的弹窗捕获到的新快捷键
+    HotkeyCaptured(String),
+    /// 录制中捕捉到的一次操作
+    RecordedInput {
+        opt_cate: OptCate,
+        opt_type: String,
+        x: f64,
+        y: f64,
+        hwnd: String,
+        title: String,
+    },
+    /// 录制中把刚记下的那一次点击并成了双击
+    RecordedDoubleClick {
+        opt_type: String,
+        x: f64,
+        y: f64,
+        hwnd: String,
+        title: String,
+    },
     ExecutionFinished,
 }
 
@@ -107,6 +139,15 @@ pub struct IClick {
     hide_when_choose: bool,
     watch_hotkey: bool,
     hotkey_flag: Arc<AtomicBool>,
+    /// 四个全局快捷键的绑定，和监听线程共享。
+    hotkeys: Arc<std::sync::Mutex<HotkeySettings>>,
+    /// 弹窗是否正在等用户按下新快捷键（置位后监听线程只捕获按键）。
+    hotkey_capture_flag: Arc<AtomicBool>,
+    /// 正在修改快捷键的弹窗。
+    hotkey_modal: Option<HotkeyModal>,
+    /// 是否正在录制操作。
+    is_recording: bool,
+    record_flag: Arc<AtomicBool>,
     execution_flag: Arc<AtomicBool>,
     is_running: bool,
     execution_event_tx: async_channel::Sender<HotkeyEvent>,
@@ -121,6 +162,10 @@ pub struct IClick {
     fuzzy_round_input: Entity<InputState>, // 模糊范围
     loop_gap_ipt: Entity<InputState>,      // 循环间隔
     opt_gap_ipt: Entity<InputState>,       // 循环间隔
+    // 操作二（纯前台连点）的输入框
+    click_hotkey_input: Entity<InputState>, // 开始/停止快捷键
+    click_gap_input: Entity<InputState>,    // 点击间隔
+    click_count_input: Entity<InputState>,  // 点击次数
     _input_subscriptions: Vec<Subscription>,
     data_table: Entity<TableState<MyTableDelegate>>,
 }
@@ -141,7 +186,7 @@ pub enum OptCate {
     鼠标,
     键盘,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseOptType {
     左键单击,
     左键双击,
@@ -152,10 +197,14 @@ pub enum MouseOptType {
     右键双击,
 }
 
+/// “操作方式”下拉框里左键双击的文案；它同时也是行数据里保存的值，
+/// 执行时按这个值判断该行要发一次单击还是双击。
+const LEFT_DOUBLE_CLICK_LABEL: &str = "左键双击";
+
 static MOUSE_OPT_TYPE_LABELS: LazyLock<[SharedString; 7]> = LazyLock::new(|| {
     [
         "左键单击".into(),
-        "左键双击".into(),
+        LEFT_DOUBLE_CLICK_LABEL.into(),
         "滚轮上滑".into(),
         "滚轮下滑".into(),
         "滚轮单击".into(),
@@ -165,6 +214,17 @@ static MOUSE_OPT_TYPE_LABELS: LazyLock<[SharedString; 7]> = LazyLock::new(|| {
 });
 
 impl MouseOptType {
+    /// 表格里的“操作方式”下拉框顺序，也是 [`MOUSE_OPT_TYPE_LABELS`] 的下标。
+    const ALL: [MouseOptType; 7] = [
+        Self::左键单击,
+        Self::左键双击,
+        Self::滚轮上滑,
+        Self::滚轮下滑,
+        Self::滚轮单击,
+        Self::右键单击,
+        Self::右键双击,
+    ];
+
     fn index(&self) -> usize {
         match self {
             Self::左键单击 => 0,
@@ -174,6 +234,31 @@ impl MouseOptType {
             Self::滚轮单击 => 4,
             Self::右键单击 => 5,
             Self::右键双击 => 6,
+        }
+    }
+
+    /// 下拉框里显示的文案，同时也是行数据里保存的值。
+    fn label(&self) -> &'static SharedString {
+        &MOUSE_OPT_TYPE_LABELS[self.index()]
+    }
+
+    /// 从行数据里保存的文案还原操作方式；空值或不认识的文案返回 None。
+    fn from_label(label: &str) -> Option<Self> {
+        let label = label.trim();
+        Self::ALL.into_iter().find(|kind| kind.label().as_ref() == label)
+    }
+
+    /// 双击需要在第一次点按之后再补一组按下/抬起。
+    fn is_double_click(&self) -> bool {
+        matches!(self, Self::左键双击 | Self::右键双击)
+    }
+
+    /// 双击对应的那一次单击；录制时用它确认上一行就是这次点击。
+    fn single_click(&self) -> Option<Self> {
+        match self {
+            Self::左键双击 => Some(Self::左键单击),
+            Self::右键双击 => Some(Self::右键单击),
+            _ => None,
         }
     }
 }
@@ -189,6 +274,308 @@ impl SelectItem for MouseOptType {
         &MOUSE_OPT_TYPE_LABELS[self.index()]
     }
 }
+
+/// 操作一里可以自定义的四个全局快捷键。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HotkeyAction {
+    /// 开始录制
+    Record,
+    /// 开始/暂停执行
+    ToggleRun,
+    /// 把鼠标当前位置记成一行鼠标操作
+    MouseEvent,
+    /// 把鼠标当前位置记成一行键盘操作
+    KeyboardEvent,
+}
+
+impl HotkeyAction {
+    const ALL: [HotkeyAction; 4] = [
+        HotkeyAction::Record,
+        HotkeyAction::ToggleRun,
+        HotkeyAction::MouseEvent,
+        HotkeyAction::KeyboardEvent,
+    ];
+
+    fn default_key(self) -> &'static str {
+        match self {
+            Self::Record => "F10",
+            Self::ToggleRun => "F8",
+            Self::MouseEvent => "F6",
+            Self::KeyboardEvent => "F7",
+        }
+    }
+
+    /// 弹窗里显示的操作名。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Record => "开始录制",
+            Self::ToggleRun => "开始/暂停",
+            Self::MouseEvent => "鼠标事件",
+            Self::KeyboardEvent => "键盘事件",
+        }
+    }
+}
+
+/// 四个快捷键当前的绑定，键名和 [`keyboard_key_label`] 给出的标签一致（如 "F8"、"A"）。
+///
+/// 这份配置被监听线程共享：每次按键都现读现比，所以弹窗里改完（重新注册）
+/// 下一次按键就按新绑定走，不需要另外向系统注销/注册热键。
+#[derive(Clone, Debug)]
+struct HotkeySettings {
+    record: String,
+    toggle_run: String,
+    mouse_event: String,
+    keyboard_event: String,
+}
+
+impl Default for HotkeySettings {
+    fn default() -> Self {
+        Self {
+            record: HotkeyAction::Record.default_key().to_string(),
+            toggle_run: HotkeyAction::ToggleRun.default_key().to_string(),
+            mouse_event: HotkeyAction::MouseEvent.default_key().to_string(),
+            keyboard_event: HotkeyAction::KeyboardEvent.default_key().to_string(),
+        }
+    }
+}
+
+impl HotkeySettings {
+    fn get(&self, action: HotkeyAction) -> &String {
+        match action {
+            HotkeyAction::Record => &self.record,
+            HotkeyAction::ToggleRun => &self.toggle_run,
+            HotkeyAction::MouseEvent => &self.mouse_event,
+            HotkeyAction::KeyboardEvent => &self.keyboard_event,
+        }
+    }
+
+    fn get_mut(&mut self, action: HotkeyAction) -> &mut String {
+        match action {
+            HotkeyAction::Record => &mut self.record,
+            HotkeyAction::ToggleRun => &mut self.toggle_run,
+            HotkeyAction::MouseEvent => &mut self.mouse_event,
+            HotkeyAction::KeyboardEvent => &mut self.keyboard_event,
+        }
+    }
+
+    fn set(&mut self, action: HotkeyAction, key: impl Into<String>) {
+        *self.get_mut(action) = key.into();
+    }
+
+    /// 绑定值是否就是这次按下的键（忽略大小写，空绑定不算）。
+    fn matches(bound: &str, pressed: &str) -> bool {
+        let bound = bound.trim();
+        !bound.is_empty() && bound.eq_ignore_ascii_case(pressed.trim())
+    }
+
+    /// 除了 `action`，还有哪个操作占用了 `key`。
+    fn conflict(&self, action: HotkeyAction, key: &str) -> Option<HotkeyAction> {
+        HotkeyAction::ALL
+            .into_iter()
+            .find(|candidate| *candidate != action && Self::matches(self.get(*candidate), key))
+    }
+}
+
+/// 修改快捷键弹窗的状态。
+#[derive(Clone, Debug)]
+struct HotkeyModal {
+    action: HotkeyAction,
+    /// 待确认的新快捷键。
+    draft: String,
+    /// 是否正在等待用户按下新快捷键。
+    capturing: bool,
+    /// 与其它操作撞车时，撞上的那个操作。
+    conflict: Option<HotkeyAction>,
+}
+
+fn lock_hotkeys(
+    hotkeys: &Arc<std::sync::Mutex<HotkeySettings>>,
+) -> std::sync::MutexGuard<'_, HotkeySettings> {
+    hotkeys
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 监听线程里判断这次按下的键是不是某个操作当前的快捷键。
+fn hotkey_pressed(
+    hotkeys: &Arc<std::sync::Mutex<HotkeySettings>>,
+    action: HotkeyAction,
+    pressed: &str,
+) -> bool {
+    HotkeySettings::matches(lock_hotkeys(hotkeys).get(action), pressed)
+}
+
+/// 监听线程里跟踪的修饰键状态。快捷键和录制的组合键都要靠它拼键名。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModifierState {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    meta: bool,
+}
+
+impl ModifierState {
+    /// 按下/松开一个键；返回 true 表示这个键本身就是修饰键。
+    fn update(&mut self, key: &RdevKey, pressed: bool) -> bool {
+        match key {
+            RdevKey::ControlLeft | RdevKey::ControlRight => self.ctrl = pressed,
+            RdevKey::ShiftLeft | RdevKey::ShiftRight => self.shift = pressed,
+            RdevKey::Alt | RdevKey::AltGr => self.alt = pressed,
+            RdevKey::MetaLeft | RdevKey::MetaRight => self.meta = pressed,
+            _ => return false,
+        }
+        true
+    }
+
+    /// 组合键的文字前缀，顺序固定为 CTRL、SHIFT、ALT、WIN。
+    fn prefixes(&self, shift_as_modifier: bool) -> Vec<&'static str> {
+        let mut prefixes = Vec::new();
+        if self.ctrl {
+            prefixes.push("CTRL");
+        }
+        if self.shift && shift_as_modifier {
+            prefixes.push("SHIFT");
+        }
+        if self.alt {
+            prefixes.push("ALT");
+        }
+        if self.meta {
+            prefixes.push("WIN");
+        }
+        prefixes
+    }
+}
+
+/// 快捷键用的规范键名："F8"、"CTRL+SHIFT+A" 这样。
+/// 修饰键顺序固定、字母统一大写，所以录制时写进去的绑定和按下时拼出来的键名一定一致；
+/// 带上修饰键之后，Ctrl+F8 也不会误触发只绑了 F8 的操作。
+fn hotkey_key_label(modifiers: &ModifierState, key: &RdevKey) -> String {
+    let base = keyboard_key_label(key, false).to_uppercase();
+    let mut parts = modifiers.prefixes(true);
+    parts.push(&base);
+    parts.join("+")
+}
+
+/// 表格里“键盘操作”保存的键名。普通打字保留原样的字符（大小写跟着 Shift/CapsLock 走），
+/// 组合键写成 "CTRL+SHIFT+a"、"SHIFT+F5"，执行时按组合键发出去。
+fn keyboard_row_label(modifiers: &ModifierState, caps_lock: bool, key: &RdevKey) -> String {
+    // 带 Ctrl/Alt/Win 的组合键按“物理键 + 修饰键”记录：Shift 单独写出来，
+    // 免得 CTRL+SHIFT+A 被记成 CTRL+A（那是另一个快捷键）。
+    if modifiers.ctrl || modifiers.alt || modifiers.meta {
+        let base = keyboard_key_label(key, false);
+        let mut parts = modifiers.prefixes(true);
+        parts.push(&base);
+        return parts.join("+");
+    }
+
+    let base = keyboard_key_label(key, modifiers.shift ^ caps_lock);
+    // 字母的 Shift 已经体现在大小写上（a / A），不用再写成 SHIFT+；
+    // 数字、符号和功能键不行，得把 SHIFT 写出来，执行时才能打出 Shift+1 这种字符。
+    let folded_into_case =
+        base.chars().count() == 1 && base.chars().all(|ch| ch.is_ascii_alphabetic());
+    let mut parts = modifiers.prefixes(!folded_into_case);
+    parts.push(&base);
+    parts.join("+")
+}
+
+/// 把表格里的键盘操作拆成（修饰键虚拟键码, 主键名）。没有组合时修饰键是空的。
+fn split_keyboard_combo(label: &str) -> (Vec<usize>, String) {
+    let mut parts: Vec<&str> = label
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(base) = parts.pop() else {
+        return (Vec::new(), String::new());
+    };
+    let mut modifiers = Vec::new();
+    for part in parts {
+        match part.to_uppercase().as_str() {
+            "CTRL" | "CONTROL" => modifiers.push(0x11),
+            "SHIFT" => modifiers.push(0x10),
+            "ALT" => modifiers.push(0x12),
+            "WIN" | "META" => modifiers.push(0x5B),
+            _ => {}
+        }
+    }
+    (modifiers, base.to_string())
+}
+
+/// 把按键标签转成 Kbd 能显示的 Keystroke。
+/// gpui 用 “-” 分隔修饰键，所以 "CTRL+SHIFT+A" 要写成 "ctrl-shift-a"；
+/// 给出的标签都解析得动，兜底只是为了不 panic。
+fn hotkey_keystroke(label: &str) -> Keystroke {
+    let source = label
+        .split('+')
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    Keystroke::parse(&source)
+        .unwrap_or_else(|_| Keystroke::parse("f1").expect("f1 一定是合法按键"))
+}
+
+/// 录制时把鼠标键映射成表格里的操作方式。
+fn recorded_mouse_opt_type(button: RdevButton) -> Option<MouseOptType> {
+    match button {
+        RdevButton::Left => Some(MouseOptType::左键单击),
+        RdevButton::Right => Some(MouseOptType::右键单击),
+        RdevButton::Middle => Some(MouseOptType::滚轮单击),
+        _ => None,
+    }
+}
+
+/// 录制时把鼠标键映射成双击的操作方式；中键没有双击的说法。
+fn recorded_double_opt_type(button: RdevButton) -> Option<MouseOptType> {
+    match button {
+        RdevButton::Left => Some(MouseOptType::左键双击),
+        RdevButton::Right => Some(MouseOptType::右键双击),
+        _ => None,
+    }
+}
+
+/// 系统“双击范围”（像素），默认 4。
+fn double_click_area() -> f64 {
+    let x = unsafe { GetSystemMetrics(SM_CXDOUBLECLK) };
+    let y = unsafe { GetSystemMetrics(SM_CYDOUBLECLK) };
+    x.max(y).clamp(1, 32) as f64
+}
+
+/// 两次鼠标按下算不算一次双击：同一个键、间隔在系统双击时间之内、位置基本没动。
+fn is_double_click(
+    previous: Option<(RdevButton, Instant, f64, f64)>,
+    button: RdevButton,
+    now: Instant,
+    x: f64,
+    y: f64,
+) -> bool {
+    let Some((last_button, last_time, last_x, last_y)) = previous else {
+        return false;
+    };
+    if last_button != button {
+        return false;
+    }
+    if now.duration_since(last_time) > Duration::from_millis(double_click_time_ms()) {
+        return false;
+    }
+    (x - last_x).abs() <= double_click_area() && (y - last_y).abs() <= double_click_area()
+}
+
+/// 新建行的默认操作方式：鼠标行是左键单击，键盘行留空等捕获按键。
+fn default_opt_type(opt_cate: &OptCate) -> String {
+    match opt_cate {
+        OptCate::鼠标 => MouseOptType::左键单击.label().to_string(),
+        OptCate::键盘 => String::new(),
+    }
+}
+
+/// 界面上所有字体统一 12px；组件内部的字号是按 `Size` 反推的
+/// （`text_size(size * 0.875)`），所以下拉框这种只认 Size 的控件要喂 12 / 0.875 进去。
+/// 这样连它展开的菜单一起都是 12px，而高度、内边距仍与 `.small()` 一致。
+fn component_size_for_12px() -> Pixels {
+    px(12.0 / 0.875)
+}
+
 #[derive(Clone, Debug)]
 
 struct MyData {
@@ -238,6 +625,7 @@ struct MyTableDelegate {
     execute_time_subscriptions: Vec<Subscription>,
     opt_cate_subscriptions: Vec<Subscription>,
     opt_type_subscriptions: Vec<Subscription>,
+    opt_type_select_subscriptions: Vec<Subscription>,
     focused_keyboard_row: Arc<std::sync::Mutex<Option<usize>>>,
     expected_keyboard_value: Arc<std::sync::Mutex<Option<(usize, String)>>>,
 }
@@ -259,6 +647,7 @@ impl MyTableDelegate {
         let execute_time_subscriptions: Vec<Subscription> = vec![];
         let opt_cate_subscriptions: Vec<Subscription> = vec![];
         let opt_type_subscriptions: Vec<Subscription> = vec![];
+        let opt_type_select_subscriptions: Vec<Subscription> = vec![];
 
         Self {
             data,
@@ -280,6 +669,7 @@ impl MyTableDelegate {
             execute_time_subscriptions,
             opt_cate_subscriptions,
             opt_type_subscriptions,
+            opt_type_select_subscriptions,
             focused_keyboard_row,
             expected_keyboard_value,
         }
@@ -465,41 +855,84 @@ impl MyTableDelegate {
             move |table: &mut TableState<MyTableDelegate>,
                   select,
                   event: &SelectEvent<SearchableVec<OptCate>>,
-                  _window,
+                  window,
                   cx: &mut Context<TableState<MyTableDelegate>>| {
-                if let SelectEvent::Confirm(Some(value)) = event {
-                    let Some(row_ix) = table
-                        .delegate()
-                        .opt_cate_selects
-                        .iter()
-                        .position(|candidate| candidate == select)
-                    else {
-                        return;
-                    };
-                    table.delegate_mut().data[row_ix].opt_cate = match value.as_ref() {
-                        "鼠标" => OptCate::鼠标,
-                        "键盘" => OptCate::键盘,
-                        _ => return,
-                    };
-                    cx.notify();
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let Some(row_ix) = table
+                    .delegate()
+                    .opt_cate_selects
+                    .iter()
+                    .position(|candidate| candidate == select)
+                else {
+                    return;
+                };
+                let opt_cate = match value.as_ref() {
+                    "鼠标" => OptCate::鼠标,
+                    "键盘" => OptCate::键盘,
+                    _ => return,
+                };
+                // 换了操作类型就换一套“操作方式”控件，行数据也要跟着复位成
+                // 新控件的当前取值（鼠标默认左键单击，键盘留空等捕获按键），
+                // 免得表格里显示的操作方式和实际执行的不是一回事。
+                let opt_type_select = table.delegate().opt_type_selects.get(row_ix).cloned();
+                let opt_type = default_opt_type(&opt_cate);
+                {
+                    let row = &mut table.delegate_mut().data[row_ix];
+                    row.opt_cate = opt_cate;
+                    row.opt_type = opt_type;
                 }
+                if let Some(opt_type_select) = opt_type_select {
+                    opt_type_select.update(cx, |select, cx| {
+                        select.set_selected_index(Some(IndexPath::new(0)), window, cx);
+                    });
+                }
+                cx.notify();
             },
         );
         self.opt_cate_subscriptions.push(subscription);
 
-        // 给新行创建 Select —— 用传进来的 window
-        let options = SearchableVec::new(vec![
-            MouseOptType::左键单击,
-            MouseOptType::左键双击,
-            MouseOptType::滚轮上滑,
-            MouseOptType::滚轮下滑,
-            MouseOptType::滚轮单击,
-            MouseOptType::右键单击,
-            MouseOptType::右键双击,
-        ]);
-        let select: Entity<SelectState<SearchableVec<MouseOptType>>> =
-            cx.new(|cx| SelectState::new(options, Some(IndexPath::default()), window, cx));
-        self.opt_type_selects.push(select);
+        // 给新行创建“操作方式”下拉框 —— 用传进来的 window
+        let options = SearchableVec::new(MouseOptType::ALL.to_vec());
+        let opt_type_select: Entity<SelectState<SearchableVec<MouseOptType>>> = cx.new(|cx| {
+            SelectState::new(
+                options,
+                // 恢复成行数据里已经保存的操作方式，而不是永远停在第一项。
+                Some(IndexPath::new(
+                    MouseOptType::from_label(&data.opt_type).map_or(0, |kind| kind.index()),
+                )),
+                window,
+                cx,
+            )
+        });
+        self.opt_type_selects.push(opt_type_select.clone());
+
+        // 下拉框里换一种操作方式，就写回行数据，执行时按它决定发哪种鼠标输入。
+        let subscription = cx.subscribe_in(
+            &opt_type_select,
+            window,
+            move |table: &mut TableState<MyTableDelegate>,
+                  select,
+                  event: &SelectEvent<SearchableVec<MouseOptType>>,
+                  _window,
+                  cx: &mut Context<TableState<MyTableDelegate>>| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let Some(row_ix) = table
+                    .delegate()
+                    .opt_type_selects
+                    .iter()
+                    .position(|candidate| candidate == select)
+                else {
+                    return;
+                };
+                table.delegate_mut().data[row_ix].opt_type = value.to_string();
+                cx.notify();
+            },
+        );
+        self.opt_type_select_subscriptions.push(subscription);
 
         cx.notify();
     }
@@ -531,7 +964,7 @@ impl TableDelegate for MyTableDelegate {
             .justify_center()
             .bg(gpui::rgb(0xf8f9fa))
             .w_full()
-            .text_size(px(13.0))
+            .text_size(px(12.0))
             .child(self.column(col_ix, cx).name.clone())
     }
 
@@ -552,12 +985,16 @@ impl TableDelegate for MyTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let table = cx.entity().clone();
-        menu.item(PopupMenuItem::new("删除本行").on_click(move |_, _, cx| {
-            table.update(cx, |table, cx| {
-                table.delegate_mut().remove_row(row_ix);
-                cx.notify();
-            });
-        }))
+        menu.item(
+            // 弹窗菜单的条目字号是组件内部写死的，用自己的元素才能跟着全局的 12px。
+            PopupMenuItem::element(|_, _| div().text_size(px(12.0)).child("删除本行"))
+                .on_click(move |_, _, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().remove_row(row_ix);
+                        cx.notify();
+                    });
+                }),
+        )
     }
 
     fn render_td(
@@ -581,7 +1018,7 @@ impl TableDelegate for MyTableDelegate {
                 .child(
                     Select::new(&self.opt_cate_selects[row_ix])
                         .placeholder("选择类型")
-                        .small()
+                        .with_size(component_size_for_12px())
                         .w(px(70.0)),
                 )
                 .into_any_element(),
@@ -593,7 +1030,7 @@ impl TableDelegate for MyTableDelegate {
                     .child(
                         Select::new(&self.opt_type_selects[row_ix])
                             .placeholder("操作方式")
-                            .small()
+                            .with_size(component_size_for_12px())
                             .w(px(95.0)),
                     )
                     .into_any_element(),
@@ -606,7 +1043,7 @@ impl TableDelegate for MyTableDelegate {
                             .size_full()
                             .w(px(95.0))
                             .px_1()
-                            .text_xs()
+                            .text_size(px(12.0))
                             .rounded(px(4.0))
                             .py_0(),
                     )
@@ -622,7 +1059,7 @@ impl TableDelegate for MyTableDelegate {
                         .size_full()
                         .w(px(65.))
                         .px_1()
-                        .text_xs()
+                        .text_size(px(12.0))
                         .rounded(px(4.))
                         .py_0(),
                 )
@@ -636,7 +1073,7 @@ impl TableDelegate for MyTableDelegate {
                         .size_full()
                         .w(px(70.))
                         .px_1()
-                        .text_xs()
+                        .text_size(px(12.0))
                         .rounded(px(4.))
                         .py_0(),
                 )
@@ -644,11 +1081,35 @@ impl TableDelegate for MyTableDelegate {
             _ => "".to_string().into_any_element(),
         };
 
-        div().p(px(0.0)).flex().text_xs().items_center().child(text)
+        div().p(px(0.0)).flex().text_size(px(12.0)).items_center().child(text)
     }
 }
 
 impl MyTableDelegate {
+    /// 录制时把刚记下的那一次点击并成双击：只有最后一行正好是同一次单击（同样的键、
+    /// 位置在系统双击范围之内）才成立，免得把别的操作误改成双击。
+    /// 返回 true 表示这一行已经就地升级成双击。
+    fn upgrade_last_mouse_row(&mut self, opt_type: MouseOptType, x: f64, y: f64) -> bool {
+        let Some(single) = opt_type.single_click() else {
+            return false;
+        };
+        let Some(row) = self.data.last_mut() else {
+            return false;
+        };
+        if !matches!(row.opt_cate, OptCate::鼠标) {
+            return false;
+        }
+        if row.opt_type.as_str() != single.label().as_ref() {
+            return false;
+        }
+        let area = double_click_area();
+        if (row.x as f64 - x).abs() > area || (row.y as f64 - y).abs() > area {
+            return false;
+        }
+        row.opt_type = opt_type.label().to_string();
+        true
+    }
+
     #[allow(unused_must_use)]
     fn remove_row(&mut self, row_ix: usize) {
         if row_ix >= self.data.len() {
@@ -665,6 +1126,7 @@ impl MyTableDelegate {
         let _ = self.execute_time_subscriptions.remove(row_ix);
         let _ = self.opt_cate_subscriptions.remove(row_ix);
         let _ = self.opt_type_subscriptions.remove(row_ix);
+        let _ = self.opt_type_select_subscriptions.remove(row_ix);
 
         let mut focused_row = self.focused_keyboard_row.lock().unwrap();
         if *focused_row == Some(row_ix) {
@@ -786,6 +1248,7 @@ impl IClick {
         hwnd: String,
         title: String,
         opt_cate: OptCate,
+        opt_type: Option<String>,
     ) {
         self.x_input.update(cx, |input, cx| {
             input.set_value(&(x.round() as usize).to_string(), window, cx);
@@ -797,10 +1260,8 @@ impl IClick {
             input.set_value(&title, window, cx);
         });
 
-        let opt_type = match opt_cate {
-            OptCate::鼠标 => "左键单击".to_string(),
-            OptCate::键盘 => String::new(),
-        };
+        // 录制出来的行带着当时用的操作方式，热键插的行用默认值。
+        let opt_type = opt_type.unwrap_or_else(|| default_opt_type(&opt_cate));
         let data = MyData {
             x: x.round() as usize,
             y: y.round() as usize,
@@ -835,10 +1296,7 @@ impl IClick {
         } else {
             OptCate::鼠标
         };
-        let opt_type = match opt_cate {
-            OptCate::鼠标 => "左键单击".to_string(),
-            OptCate::键盘 => String::new(),
-        };
+        let opt_type = default_opt_type(&opt_cate);
 
         let data = MyData {
             x,
@@ -855,6 +1313,256 @@ impl IClick {
             table.delegate_mut().add_row(window, cx, data);
         });
         cx.notify();
+    }
+
+    /// 某个操作当前绑定的快捷键。
+    fn hotkey_label(&self, action: HotkeyAction) -> String {
+        lock_hotkeys(&self.hotkeys).get(action).clone()
+    }
+
+    /// 界面上显示快捷键的小标签。
+    fn hotkey_kbd(&self, action: HotkeyAction) -> Kbd {
+        Kbd::new(hotkey_keystroke(&self.hotkey_label(action)))
+            .outline()
+            .text_size(px(12.0))
+            .pt_1()
+            .pb_1()
+    }
+
+    /// 打开“修改快捷键”弹窗，同时开始捕捉新按键。
+    fn open_hotkey_modal(&mut self, action: HotkeyAction, cx: &mut Context<Self>) {
+        self.hotkey_modal = Some(HotkeyModal {
+            action,
+            draft: self.hotkey_label(action),
+            capturing: true,
+            conflict: None,
+        });
+        self.start_hotkey_capture(cx);
+    }
+
+    /// 让监听线程把下一次按键交回来当新快捷键。
+    fn start_hotkey_capture(&mut self, cx: &mut Context<Self>) {
+        if let Some(modal) = self.hotkey_modal.as_mut() {
+            modal.capturing = true;
+            modal.conflict = None;
+            self.hotkey_capture_flag.store(true, Ordering::Release);
+            cx.notify();
+        }
+    }
+
+    fn close_hotkey_modal(&mut self, cx: &mut Context<Self>) {
+        self.hotkey_capture_flag.store(false, Ordering::Release);
+        self.hotkey_modal = None;
+        cx.notify();
+    }
+
+    /// 监听线程捕捉到的按键：先只放进草稿，等用户点“确定”。
+    fn apply_captured_hotkey(&mut self, key: String, cx: &mut Context<Self>) {
+        if let Some(modal) = self.hotkey_modal.as_mut() {
+            modal.draft = key;
+            modal.capturing = false;
+            modal.conflict = None;
+        }
+        cx.notify();
+    }
+
+    /// 确认修改：写进共享的绑定表就算是“重新注册”，
+    /// 监听线程下一次按键就会按新的键名比对。
+    fn confirm_hotkey_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.hotkey_modal.clone() else {
+            return;
+        };
+        let draft = modal.draft.trim().to_string();
+        if draft.is_empty() {
+            return;
+        }
+
+        if let Some(other) = lock_hotkeys(&self.hotkeys).conflict(modal.action, &draft) {
+            if let Some(current) = self.hotkey_modal.as_mut() {
+                current.capturing = false;
+                current.conflict = Some(other);
+            }
+            cx.notify();
+            return;
+        }
+
+        lock_hotkeys(&self.hotkeys).set(modal.action, draft);
+        self.close_hotkey_modal(cx);
+    }
+
+    /// 开始/停止录制：录制期间监听线程把鼠标按键、滚轮和键盘按键都记成表格里的行。
+    fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+        self.is_recording = !self.is_recording;
+        self.record_flag.store(self.is_recording, Ordering::Release);
+        cx.notify();
+    }
+
+    /// 修改快捷键的弹窗：铺满窗口的遮罩 + 居中的小面板。
+    /// 遮罩自己不响应点击（只挡住下面的表格），关掉弹窗要点“取消”。
+    fn render_hotkey_modal(&mut self, modal: &HotkeyModal, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel = div()
+            .w(px(300.0))
+            .p(px(14.0))
+            .rounded(px(6.0))
+            .border(px(1.0))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .mb(px(10.0))
+                    .child(format!("修改快捷键：{}", modal.action.label())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(10.0))
+                    .rounded(px(4.0))
+                    .border(px(1.0))
+                    .border_color(if modal.capturing {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().border
+                    })
+                    .child(
+                        Kbd::new(hotkey_keystroke(&modal.draft))
+                            .outline()
+                            .text_size(px(12.0)),
+                    )
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .text_size(px(12.0))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if modal.capturing {
+                                "请按下新的快捷键，可配合 Ctrl/Shift/Alt"
+                            } else {
+                                "已捕捉到新快捷键"
+                            }),
+                    ),
+            );
+
+        if let Some(other) = modal.conflict {
+            panel = panel.child(
+                div()
+                    .mt(px(8.0))
+                    .text_size(px(12.0))
+                    .text_color(cx.theme().danger)
+                    .child(format!(
+                        "“{}”已经是“{}”的快捷键了，请换一个键",
+                        modal.draft,
+                        other.label()
+                    )),
+            );
+        }
+
+        div()
+            .id("hotkey_modal_backdrop")
+            .occlude() // 遮罩要把鼠标事件全挡住，别让点空白处点到下面的表格
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(cx.theme().overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                panel.child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .mt(px(14.0))
+                        .child(
+                            Button::new("hotkey_recapture")
+                                .label("重新录制")
+                                .small()
+                                .text_size(px(12.0))
+                                .mr(px(8.0))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.start_hotkey_capture(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("hotkey_cancel")
+                                .label("取消")
+                                .small()
+                                .text_size(px(12.0))
+                                .mr(px(8.0))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_hotkey_modal(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("hotkey_confirm")
+                                .label("确定")
+                                .small()
+                                .text_size(px(12.0))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_hotkey_modal(cx);
+                                })),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// 操作二：纯前台连点，先按截图把界面摆出来。
+    fn render_opt_two(&mut self, _cx: &mut Context<Self>) -> Div {
+        div()
+            .size_full()
+            .bg(rgb(0xf6f6f6))
+            .p(px(8.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .mb(px(16.0))
+                    .child("纯前台连点，按下快捷键开始点击，鼠标在哪就点"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .mb(px(14.0))
+                    .child(div().child("开始/停止快捷键："))
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .w(px(88.0))
+                            .child(Input::new(&self.click_hotkey_input).small().text_size(px(12.0))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .mb(px(14.0))
+                    .child(div().child("点击间隔："))
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .w(px(46.0))
+                            .child(Input::new(&self.click_gap_input).small().text_size(px(12.0))),
+                    )
+                    .child(div().ml(px(6.0)).child("ms")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().child("点击次数："))
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .w(px(46.0))
+                            .child(Input::new(&self.click_count_input).small().text_size(px(12.0))),
+                    ),
+            )
     }
 }
 
@@ -1021,6 +1729,38 @@ fn keyboard_virtual_key(value: &str) -> Option<usize> {
     }
 }
 
+/// 按键名对应的虚拟键码：先查常用表，再让系统按当前键盘布局翻译单字符（标点等）。
+fn keyboard_virtual_key_for(value: &str) -> Option<usize> {
+    if let Some(key) = keyboard_virtual_key(value) {
+        return Some(key);
+    }
+    let mut chars = value.trim().chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let scanned = unsafe { VkKeyScanW(ch as u16) };
+    // 返回值的低字节是虚拟键码，-1 表示这个字符在当前布局上打不出来。
+    (scanned != -1).then(|| scanned as usize & 0xff)
+}
+
+fn key_input(vk: usize, key_up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk as u16),
+                dwFlags: if key_up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            },
+        },
+    }
+}
+
 fn send_input_key(hwnd: HWND, key: &str) {
     unsafe {
         let top_level = GetAncestor(hwnd, GA_ROOT);
@@ -1030,32 +1770,20 @@ fn send_input_key(hwnd: HWND, key: &str) {
             top_level
         });
     }
-    let is_character = key.chars().count() == 1;
+
+    let (modifiers, base) = split_keyboard_combo(key);
+    // 单个字符且不带修饰键：直接注入字符，中文、标点都发得出去。
+    let is_character = modifiers.is_empty() && base.chars().count() == 1;
     let inputs = if !is_character {
-        let Some(vk) = keyboard_virtual_key(key) else {
+        let Some(vk) = keyboard_virtual_key_for(&base) else {
             return;
         };
-        vec![
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk as u16),
-                        ..Default::default()
-                    },
-                },
-            },
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk as u16),
-                        dwFlags: KEYEVENTF_KEYUP,
-                        ..Default::default()
-                    },
-                },
-            },
-        ]
+        // 组合键：修饰键按下 → 主键按下抬起 → 修饰键反序抬起。
+        let mut inputs: Vec<INPUT> = modifiers.iter().map(|vk| key_input(*vk, false)).collect();
+        inputs.push(key_input(vk, false));
+        inputs.push(key_input(vk, true));
+        inputs.extend(modifiers.iter().rev().map(|vk| key_input(*vk, true)));
+        inputs
     } else {
         key.encode_utf16()
             .flat_map(|unit| {
@@ -1091,6 +1819,57 @@ fn send_input_key(hwnd: HWND, key: &str) {
     }
 }
 
+/// 该行的操作方式是否为左键双击（只有测试直接用它断言双击语义）。
+#[cfg(test)]
+fn is_left_double_click(opt_type: &str) -> bool {
+    MouseOptType::from_label(opt_type) == Some(MouseOptType::左键双击)
+}
+
+/// 系统“双击速度”对应的判定时间（毫秒），默认 500。
+fn double_click_time_ms() -> u64 {
+    (unsafe { GetDoubleClickTime() } as u64).clamp(200, 900)
+}
+
+/// 一次双击中两次点按之间的间隔。
+/// 必须大于 0：间隔为 0 时，按时间差判定双击的程序（部分游戏、自绘控件）
+/// 会把两下并成一下；又必须远小于系统双击判定时间，否则就不是双击而是两次单击。
+fn double_click_gap() -> Duration {
+    Duration::from_millis((double_click_time_ms() / 8).clamp(15, 60))
+}
+
+fn mouse_input(flags: MOUSE_EVENT_FLAGS, mouse_data: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dwFlags: flags,
+                mouseData: mouse_data,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+/// 注入一组完整的按下/抬起。
+fn send_input_click(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS) {
+    let click = [mouse_input(down, 0), mouse_input(up, 0)];
+    unsafe {
+        let _ = SendInput(&click, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 注入一次滚轮；滚动量放在 mouseData 里，向下滚是负值。
+fn send_input_wheel(delta: i32) {
+    let wheel = [mouse_input(MOUSEEVENTF_WHEEL, delta as u32)];
+    unsafe {
+        let _ = SendInput(&wheel, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 前台操作：把光标移到目标点，再用 SendInput 注入真实鼠标输入。
+/// 双击就注入两组“按下/抬起”：SendInput 走的是系统输入队列，
+/// 第二组会被系统自身的双击判定识别，并自动合成 WM_*BUTTONDBLCLK，
+/// 所以这里不需要（也不应该）自己补发那条消息。
 fn send_input_mouse(hwnd: HWND, row: &MyData) {
     unsafe {
         let mut point = POINT {
@@ -1100,27 +1879,127 @@ fn send_input_mouse(hwnd: HWND, row: &MyData) {
         let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetCursorPos(point.x, point.y);
-        let inputs = [
-            INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dwFlags: MOUSEEVENTF_LEFTDOWN,
-                        ..Default::default()
-                    },
-                },
-            },
-            INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dwFlags: MOUSEEVENTF_LEFTUP,
-                        ..Default::default()
-                    },
-                },
-            },
-        ];
-        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+
+    // 认不出来的操作方式按左键单击处理，保证老数据也点得动。
+    let opt_type = MouseOptType::from_label(&row.opt_type).unwrap_or(MouseOptType::左键单击);
+    let (down, up) = match opt_type {
+        MouseOptType::左键单击 | MouseOptType::左键双击 => {
+            (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+        }
+        MouseOptType::右键单击 | MouseOptType::右键双击 => {
+            (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+        }
+        MouseOptType::滚轮单击 => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        MouseOptType::滚轮上滑 => {
+            send_input_wheel(WHEEL_DELTA as i32);
+            return;
+        }
+        MouseOptType::滚轮下滑 => {
+            send_input_wheel(-(WHEEL_DELTA as i32));
+            return;
+        }
+    };
+
+    // 一次单击 = 按下 + 抬起，一次 SendInput 注入一组完整点按。
+    send_input_click(down, up);
+    if opt_type.is_double_click() {
+        thread::sleep(double_click_gap());
+        send_input_click(down, up);
+    }
+}
+
+/// 窗口类是否带 CS_DBLCLKS：只有带这个样式的窗口类才会收到 WM_*BUTTONDBLCLK。
+fn class_accepts_double_click(hwnd: HWND) -> bool {
+    let class_style = unsafe { GetClassLongPtrW(hwnd, GCL_STYLE) } as u32;
+    class_style & CS_DBLCLKS.0 != 0
+}
+
+/// 后台操作：直接把鼠标消息投递给目标窗口。
+/// SendMessage 绕过了系统输入队列，系统不会替我们判定双击，
+/// 因此双击的消息序列要按窗口类样式自己补全：
+///   带 CS_DBLCLKS 的类：DOWN → UP → DBLCLK → UP（第二次按下用 WM_*BUTTONDBLCLK 代替）
+///   不带 CS_DBLCLKS 的类：真实双击对它就是两次普通按下，永远不会出现 DBLCLK 消息
+fn send_message_mouse(hwnd: HWND, row: &MyData) {
+    // 认不出来的操作方式按左键单击处理，保证老数据也点得动。
+    let opt_type = MouseOptType::from_label(&row.opt_type).unwrap_or(MouseOptType::左键单击);
+
+    // 滚轮消息的位置参数是屏幕坐标，和按键消息的客户区坐标不一样，单独发。
+    match opt_type {
+        MouseOptType::滚轮上滑 => {
+            send_message_wheel(hwnd, row, WHEEL_DELTA as i32);
+            return;
+        }
+        MouseOptType::滚轮下滑 => {
+            send_message_wheel(hwnd, row, -(WHEEL_DELTA as i32));
+            return;
+        }
+        _ => {}
+    }
+
+    let x = (row.x as u32) & 0xffff;
+    let y = (row.y as u32) & 0xffff;
+    let lparam = LPARAM(((y << 16) | x) as isize);
+
+    // 三种按键各自的按下/抬起/双击消息，以及按下时 wParam 里的按钮标志。
+    let (down_message, up_message, double_message, button_flag) = match opt_type {
+        MouseOptType::左键单击 | MouseOptType::左键双击 => (
+            WM_LBUTTONDOWN,
+            WM_LBUTTONUP,
+            WM_LBUTTONDBLCLK,
+            MK_LBUTTON,
+        ),
+        MouseOptType::右键单击 | MouseOptType::右键双击 => (
+            WM_RBUTTONDOWN,
+            WM_RBUTTONUP,
+            WM_RBUTTONDBLCLK,
+            MK_RBUTTON,
+        ),
+        MouseOptType::滚轮单击 => (
+            WM_MBUTTONDOWN,
+            WM_MBUTTONUP,
+            WM_MBUTTONDBLCLK,
+            MK_MBUTTON,
+        ),
+        MouseOptType::滚轮上滑 | MouseOptType::滚轮下滑 => unreachable!("滚轮上面已经返回"),
+    };
+
+    unsafe {
+        let _ = SendMessageW(hwnd, down_message, WPARAM(button_flag), lparam);
+        let _ = SendMessageW(hwnd, up_message, WPARAM(0), lparam);
+
+        if !opt_type.is_double_click() {
+            return;
+        }
+
+        // 两次点按之间留出节奏，让按时间差自行判定双击的程序也能识别。
+        thread::sleep(double_click_gap());
+        let second_down = if class_accepts_double_click(hwnd) {
+            double_message
+        } else {
+            down_message
+        };
+        let _ = SendMessageW(hwnd, second_down, WPARAM(button_flag), lparam);
+        let _ = SendMessageW(hwnd, up_message, WPARAM(0), lparam);
+    }
+}
+
+/// 后台发一次滚轮：WM_MOUSEWHEEL 的位置参数用屏幕坐标，
+/// 而滚动量放在 wParam 的高 16 位（向下滚是负值）。
+fn send_message_wheel(hwnd: HWND, row: &MyData, delta: i32) {
+    let mut point = POINT {
+        x: row.x as i32,
+        y: row.y as i32,
+    };
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point);
+    }
+    let x = (point.x as u32) & 0xffff;
+    let y = (point.y as u32) & 0xffff;
+    let lparam = LPARAM(((y << 16) | x) as isize);
+    let wparam = ((delta as u32) & 0xffff) << 16;
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_MOUSEWHEEL, WPARAM(wparam as usize), lparam);
     }
 }
 
@@ -1146,38 +2025,57 @@ fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool) {
             OptCate::鼠标 => {
                 if front_opt {
                     send_input_mouse(hwnd, row);
-                    return;
+                } else {
+                    send_message_mouse(hwnd, row);
                 }
-                let x = (row.x as u32) & 0xffff;
-                let y = (row.y as u32) & 0xffff;
-                let lparam = LPARAM(((y << 16) | x) as isize);
-                let _ = SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), lparam);
-                let _ = SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lparam);
             }
             OptCate::键盘 => {
                 if front_opt {
                     send_input_key(hwnd, &row.opt_type);
-                } else if row.opt_type.chars().count() == 1 {
-                    for unit in row.opt_type.encode_utf16() {
+                    return;
+                }
+
+                let (modifiers, base) = split_keyboard_combo(&row.opt_type);
+                // 单个字符且不带修饰键：老规矩，直接发字符消息。
+                if modifiers.is_empty() && base.chars().count() == 1 {
+                    for unit in base.encode_utf16() {
                         let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
                     }
-                } else if let Some(key) = keyboard_virtual_key(&row.opt_type) {
-                    let wparam = WPARAM(key);
+                    return;
+                }
+                let Some(key) = keyboard_virtual_key_for(&base) else {
+                    for unit in base.encode_utf16() {
+                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+                    }
+                    return;
+                };
+                // 组合键：修饰键按下 → 主键按下抬起 → 修饰键反序抬起。
+                for modifier in &modifiers {
                     let _ = SendMessageW(
                         hwnd,
                         WM_KEYDOWN,
-                        wparam,
-                        keyboard_message_lparam(key, false),
+                        WPARAM(*modifier),
+                        keyboard_message_lparam(*modifier, false),
                     );
-                    if key == 0x0D {
-                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(0x0D), LPARAM(0));
-                    }
-                    let _ =
-                        SendMessageW(hwnd, WM_KEYUP, wparam, keyboard_message_lparam(key, true));
-                } else {
-                    for unit in row.opt_type.encode_utf16() {
-                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
-                    }
+                }
+                let wparam = WPARAM(key);
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_KEYDOWN,
+                    wparam,
+                    keyboard_message_lparam(key, false),
+                );
+                if key == 0x0D {
+                    let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(0x0D), LPARAM(0));
+                }
+                let _ = SendMessageW(hwnd, WM_KEYUP, wparam, keyboard_message_lparam(key, true));
+                for modifier in modifiers.iter().rev() {
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_KEYUP,
+                        WPARAM(*modifier),
+                        keyboard_message_lparam(*modifier, true),
+                    );
                 }
             }
         }
@@ -1186,12 +2084,20 @@ fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool) {
 
 impl Render for IClick {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 弹窗单独构建：它要盖在整页上面，所以放在最后一个子元素。
+        let hotkey_modal = self.hotkey_modal.clone();
+        let hotkey_modal_layer = hotkey_modal
+            .map(|modal| self.render_hotkey_modal(&modal, cx))
+            .into_iter();
+
         div()
+            .relative()
             .size_full()
-            .text_xs()
+            .text_size(px(12.0))
             .child(
                 TabBar::new("tabs")
                     .small()
+                    .text_size(px(12.0))
                     .selected_index(self.active_tab)
                     .segmented()
                     .on_click(cx.listener(|view, index, _, cx| {
@@ -1201,6 +2107,7 @@ impl Render for IClick {
                     .children(self.tabs.iter().map(|tab_name| {
                         Tab::new()
                             .label(tab_name.clone())
+                            .text_size(px(12.0))
                             .cursor(CursorStyle::PointingHand)
                     })),
             )
@@ -1222,13 +2129,13 @@ impl Render for IClick {
                                     .child(
                                         GroupBox::new()
                                             .title("获取坐标方式一")
-                                            .title_style(StyleRefinement::default().text_sm())
+                                            .title_style(StyleRefinement::default().text_size(px(12.0)))
                                             .h(px(130.0))
                                             .mb(px(10.0))
                                             .child(
                                                 div()
                                                     .w_full()
-                                                    .text_xs()
+                                                    .text_size(px(12.0))
                                                     .flex_1()
                                                     .h(px(100.0))
                                                     .border(px(1.0))
@@ -1286,8 +2193,17 @@ impl Render for IClick {
                                                             RadioGroup::horizontal(
                                                                 "horizontal-group",
                                                             )
-                                                            .text_xs()
-                                                            .children(["鼠标事件", "键盘事件"])
+                                                            .text_size(px(12.0))
+                                                            // Radio 自己会把字号设成 text_base，
+                                                            // 所以每个选项都要单独压回 12px。
+                                                            .children([
+                                                                Radio::new("mouse-event")
+                                                                    .label("鼠标事件")
+                                                                    .text_size(px(12.0)),
+                                                                Radio::new("keyboard-event")
+                                                                    .label("键盘事件")
+                                                                    .text_size(px(12.0)),
+                                                            ])
                                                             .selected_index(self.opt_cate)
                                                             .on_click(cx.listener(
                                                                 |view, index, _, cx| {
@@ -1301,6 +2217,7 @@ impl Render for IClick {
                                                         div().child(
                                                             Checkbox::new("hide")
                                                                 .label("选择时隐藏本窗口")
+                                                                .text_size(px(12.0))
                                                                 .checked(self.hide_when_choose)
                                                                 .on_click({
                                                                     let view = cx.entity().clone();
@@ -1320,7 +2237,9 @@ impl Render for IClick {
                                         GroupBox::new()
                                             .title("获取坐标方式二")
                                             .title_style(
-                                                StyleRefinement::default().text_sm().h(px(20.0)),
+                                                StyleRefinement::default()
+                                                    .text_size(px(12.0))
+                                                    .h(px(20.0)),
                                             )
                                             .h(px(110.0))
                                             .child(
@@ -1336,6 +2255,7 @@ impl Render for IClick {
                                                     .child(
                                                         Checkbox::new("front_check")
                                                             .label("监听热键")
+                                                            .text_size(px(12.0))
                                                             .checked(self.watch_hotkey)
                                                             .on_click({
                                                                 let view = cx.entity().clone();
@@ -1361,7 +2281,26 @@ impl Render for IClick {
                                                                     .child("鼠标事件快捷键："),
                                                             )
                                                             .child(
-																Kbd::new(Keystroke::parse("f6").unwrap()).outline().pt_1().pb_1().flex_1()
+                                                                div()
+                                                                    .id("hotkey_mouse_event")
+                                                                    .flex_1()
+                                                                    .cursor(
+                                                                        CursorStyle::PointingHand,
+                                                                    )
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, _, cx| {
+                                                                            this.open_hotkey_modal(
+                                                                                HotkeyAction::MouseEvent,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                    .child(
+                                                                        self.hotkey_kbd(
+                                                                            HotkeyAction::MouseEvent,
+                                                                        )
+                                                                        .flex_1(),
+                                                                    ),
                                                             ),
                                                     )
                                                     .child(
@@ -1373,7 +2312,26 @@ impl Render for IClick {
                                                                     .child("键盘事件快捷键："),
                                                             )
                                                             .child(
-																Kbd::new(Keystroke::parse("f7").unwrap()).outline().pt_1().pb_1().flex_1()
+                                                                div()
+                                                                    .id("hotkey_keyboard_event")
+                                                                    .flex_1()
+                                                                    .cursor(
+                                                                        CursorStyle::PointingHand,
+                                                                    )
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, _, cx| {
+                                                                            this.open_hotkey_modal(
+                                                                                HotkeyAction::KeyboardEvent,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                    .child(
+                                                                        self.hotkey_kbd(
+                                                                            HotkeyAction::KeyboardEvent,
+                                                                        )
+                                                                        .flex_1(),
+                                                                    ),
                                                             ),
                                                     ),
                                             ),
@@ -1440,10 +2398,11 @@ impl Render for IClick {
                                                                 }
                                                             })
 														.child(
-															div().text_xs().mr(px(10.)).child("窗口置顶：")
+															div().text_size(px(12.0)).mr(px(10.)).child("窗口置顶：")
 														).child(
 														   Checkbox::new("always_on_top")
                                                             .label("")
+                                                            .text_size(px(12.0))
                                                             .checked(self.always_on_top)
 														)
 
@@ -1455,6 +2414,7 @@ impl Render for IClick {
                                                             } else {
                                                                 "开始"
                                                             })
+                                                            .text_size(px(12.0))
                                                             .w(px(140.0))
                                                             .cursor(CursorStyle::PointingHand)
                                                             .on_click({
@@ -1491,10 +2451,11 @@ impl Render for IClick {
                                                         })
 
 														.child(
-															div().mr(px(10.)).text_xs().child("前台操作：")
+															div().mr(px(10.)).text_size(px(12.0)).child("前台操作：")
 														)
 														.child( Checkbox::new("front_check")
                                                             .label("")
+                                                            .text_size(px(12.0))
                                                             .checked(self.front_opt)
 
 													)
@@ -1508,6 +2469,7 @@ impl Render for IClick {
                                                                 Button::new("read_btn")
                                                                     .label("读取")
                                                                     .small()
+                                                                    .text_size(px(12.0))
                                                                     .mr(px(10.0))
                                                                     .cursor(
                                                                         CursorStyle::PointingHand,
@@ -1539,6 +2501,7 @@ impl Render for IClick {
                                                                 Button::new("save_btn")
                                                                     .label("保存")
                                                                     .small()
+                                                                    .text_size(px(12.0))
                                                                     .cursor(
                                                                         CursorStyle::PointingHand,
                                                                     ),
@@ -1560,11 +2523,13 @@ impl Render for IClick {
                                                                     .child("循环次数：")
 																	.id("loop_count_tooltip")
 																	.tooltip(|window, cx| {
-																			Tooltip::new("表格中所有操作的总执行次数，0代表无限次").build(window, cx)
+																			Tooltip::new("表格中所有操作的总执行次数，0代表无限次")
+																				.text_size(px(12.0))
+																				.build(window, cx)
 																	}),
                                                             )
                                                             .child(div().w(px(80.0)).child(
-                                                                Input::new(&self.loop_count_input).small(),
+                                                                Input::new(&self.loop_count_input).small().text_size(px(12.0)),
                                                             )),
                                                     )
                                                     .child(
@@ -1576,12 +2541,32 @@ impl Render for IClick {
                                                                     .mr(px(10.0))
                                                                     .flex()
                                                                     .items_center()
-                                                                    .child("开始录制"),
+                                                                    .child(
+                                                                        if self.is_recording {
+                                                                            "录制中"
+                                                                        } else {
+                                                                            "开始录制"
+                                                                        },
+                                                                    ),
                                                             )
                                                             .child(
-                                                                div().w(px(80.0)).child(
-																	Kbd::new(Keystroke::parse("f10").unwrap()).outline().pt_1().pb_1()
-                                                                ),
+                                                                div()
+                                                                    .w(px(80.0))
+                                                                    .id("hotkey_record")
+                                                                    .cursor(
+                                                                        CursorStyle::PointingHand,
+                                                                    )
+                                                                    .on_click(cx.listener(
+                                                                        |this, _, _, cx| {
+                                                                            this.open_hotkey_modal(
+                                                                                HotkeyAction::Record,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    ))
+                                                                    .child(self.hotkey_kbd(
+                                                                        HotkeyAction::Record,
+                                                                    )),
                                                             ),
                                                     ),
                                             )
@@ -1607,9 +2592,10 @@ impl Render for IClick {
                                                                 }
                                                             })
 														.child(
-															div().mr(px(10.)).text_xs().child("模糊点击：")
+															div().mr(px(10.)).text_size(px(12.0)).child("模糊点击：")
 														).child(  Checkbox::new("fuzzy_click")
                                                             .label("")
+                                                            .text_size(px(12.0))
                                                             .checked(self.fuzzy_click)
 
 														)
@@ -1631,6 +2617,7 @@ impl Render for IClick {
                                                                     Input::new(
                                                                         &self.fuzzy_round_input,
                                                                     ).small()
+                                                                    .text_size(px(12.0))
                                                                     .suffix(div().child("px")),
                                                                 ),
                                                             ),
@@ -1651,7 +2638,7 @@ impl Render for IClick {
                                                                     .child("操作间隔："),
                                                             )
                                                             .child(div().w(px(80.0)).child(
-                                                                Input::new(&self.opt_gap_ipt).small().suffix(div().child("ms"))
+                                                                Input::new(&self.opt_gap_ipt).small().text_size(px(12.0)).suffix(div().child("ms"))
                                                             )),
                                                     )
                                                     .child(
@@ -1670,6 +2657,7 @@ impl Render for IClick {
                                                                     Input::new(
                                                                         &self.loop_gap_ipt,
                                                                     ).small()
+                                                                    .text_size(px(12.0))
                                                                     .suffix(div().child("ms")),
                                                                 ),
                                                             ),
@@ -1687,7 +2675,25 @@ impl Render for IClick {
                                                             .child("开始/暂停快捷键"),
                                                     )
                                                     .child(
-														Kbd::new(Keystroke::parse("f8").unwrap()).outline().pt_1().pb_1().min_w(px(100.))
+                                                        div()
+                                                            .id("hotkey_toggle_run")
+                                                            .cursor(
+                                                                CursorStyle::PointingHand,
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.open_hotkey_modal(
+                                                                        HotkeyAction::ToggleRun,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                            .child(
+                                                                self.hotkey_kbd(
+                                                                    HotkeyAction::ToggleRun,
+                                                                )
+                                                                .min_w(px(100.)),
+                                                            ),
                                                     ),
                                             ),
                                     ),
@@ -1712,7 +2718,7 @@ impl Render for IClick {
 
 							)
 							.child(div().child(
-                                                Input::new(&self.x_input).small().w(px(55.)),
+                                                Input::new(&self.x_input).small().text_size(px(12.0)).w(px(55.)),
 							)),
 						)
 						.child(
@@ -1729,7 +2735,7 @@ impl Render for IClick {
 
 							)
 							.child(div().child(
-                                                Input::new(&self.y_input).small().w(px(55.)),
+                                                Input::new(&self.y_input).small().text_size(px(12.0)).w(px(55.)),
 							)),
 						)
 						.child(
@@ -1747,7 +2753,7 @@ impl Render for IClick {
 
 							)
 							.child(div().flex_1().child(
-                                                Input::new(&self.win_hwnd_input).small(),
+                                                Input::new(&self.win_hwnd_input).small().text_size(px(12.0)),
 							)),
 						)
 						.child(
@@ -1762,7 +2768,7 @@ impl Render for IClick {
 									.id("win_title")
 							)
 							.child(div().flex_1().child(
-                                                Input::new(&self.win_title_input).small(),
+                                                Input::new(&self.win_title_input).small().text_size(px(12.0)),
 							))
 						)
 					)
@@ -1773,10 +2779,11 @@ impl Render for IClick {
                             .child(DataTable::new(&self.data_table).with_size(px(20.))),
                     )
             } else if self.active_tab == 1 {
-                div().size_full().bg(rgb(0xf6f6f6))
+                self.render_opt_two(cx)
             } else {
                 div()
             })
+            .children(hotkey_modal_layer)
     }
 }
 use regex::Regex;
@@ -1839,6 +2846,19 @@ fn main() {
                         });
                         let win_hwnd_input = cx.new(|cx| InputState::new(window, cx));
                         let win_title_input = cx.new(|cx| InputState::new(window, cx));
+                        // 操作二（纯前台连点）的三个输入框
+                        let click_hotkey_input =
+                            cx.new(|cx| InputState::new(window, cx).default_value("F9"));
+                        let click_gap_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("20")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let click_count_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("0")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
                         let input_subscriptions = vec![
                             subscribe_select_all(&loop_count_input, cx),
                             subscribe_select_all(&fuzzy_round_input, cx),
@@ -1848,6 +2868,9 @@ fn main() {
                             subscribe_select_all(&y_input, cx),
                             subscribe_select_all(&win_hwnd_input, cx),
                             subscribe_select_all(&win_title_input, cx),
+                            subscribe_select_all(&click_hotkey_input, cx),
+                            subscribe_select_all(&click_gap_input, cx),
+                            subscribe_select_all(&click_count_input, cx),
                         ];
 
                         let focused_keyboard_row = Arc::new(std::sync::Mutex::new(None::<usize>));
@@ -1861,8 +2884,11 @@ fn main() {
                         );
                         let state = cx.new(|cx| TableState::new(delegate, window, cx));
                         let choosing_flag = Arc::new(AtomicBool::new(false));
-                        let hotkey_flag = Arc::new(AtomicBool::new(false));
+                        let hotkey_flag = Arc::new(AtomicBool::new(true));
                         let execution_flag = Arc::new(AtomicBool::new(false));
+                        let record_flag = Arc::new(AtomicBool::new(false));
+                        let hotkeys = Arc::new(std::sync::Mutex::new(HotkeySettings::default()));
+                        let hotkey_capture_flag = Arc::new(AtomicBool::new(false));
                         let (mouse_tx, mouse_rx) = async_channel::unbounded::<HotkeyEvent>();
 
                         let view = cx.new(|_| IClick {
@@ -1870,7 +2896,6 @@ fn main() {
                             tabs: vec![
                                 "操作一".to_string(),
                                 "操作二".to_string(),
-                                "设置".to_string(),
                             ],
                             loop_count_input,
                             fuzzy_round_input,
@@ -1882,9 +2907,14 @@ fn main() {
                             front_opt: false,
                             fuzzy_click: false,
                             opt_cate: Some(0),
-                            hide_when_choose: true,
-                            watch_hotkey: false,
+                            hide_when_choose: false,
+                            watch_hotkey: true,
                             hotkey_flag: hotkey_flag.clone(),
+                            hotkeys: hotkeys.clone(),
+                            hotkey_capture_flag: hotkey_capture_flag.clone(),
+                            hotkey_modal: None,
+                            is_recording: false,
+                            record_flag: record_flag.clone(),
                             execution_flag: execution_flag.clone(),
                             is_running: false,
                             execution_event_tx: mouse_tx.clone(),
@@ -1895,13 +2925,21 @@ fn main() {
                             y_input,
                             win_hwnd_input,
                             win_title_input,
+                            click_hotkey_input,
+                            click_gap_input,
+                            click_count_input,
                         });
                         let listener_flag = choosing_flag.clone();
                         let hotkey_listener_flag = hotkey_flag.clone();
+                        let listener_hotkeys = hotkeys.clone();
+                        let listener_capture_flag = hotkey_capture_flag.clone();
+                        let listener_record_flag = record_flag.clone();
                         let keyboard_input_row = focused_keyboard_row.clone();
                         std::thread::spawn(move || {
-                            let mut shift_pressed = false;
+                            let mut modifiers = ModifierState::default();
                             let mut caps_lock = false;
+                            // 录制时用来把两次快速点击并成一次双击。
+                            let mut last_click: Option<(RdevButton, Instant, f64, f64)> = None;
                             let callback = move |event: Event| {
                                 if listener_flag.load(Ordering::Acquire)
                                     && let EventType::MouseMove { x: _, y: _ } = event.event_type
@@ -1916,43 +2954,155 @@ fn main() {
                                 {
                                     set_selection_cursor(false);
                                     let _ = mouse_tx.try_send(HotkeyEvent::MouseReleased);
+                                } else if let EventType::ButtonPress(button) = event.event_type {
+                                    // 录制模式：把鼠标操作记成表格里的行，
+                                    // 同一个键快速点两下就并成一次双击。
+                                    if listener_record_flag.load(Ordering::Acquire)
+                                        && let Some(opt_type) = recorded_mouse_opt_type(button)
+                                    {
+                                        let (x, y, hwnd, title) = cursor_info();
+                                        let now = Instant::now();
+                                        if let Some(double_type) = recorded_double_opt_type(button)
+                                            && is_double_click(last_click, button, now, x, y)
+                                        {
+                                            last_click = None;
+                                            let _ = mouse_tx.try_send(
+                                                HotkeyEvent::RecordedDoubleClick {
+                                                    opt_type: double_type.label().to_string(),
+                                                    x,
+                                                    y,
+                                                    hwnd,
+                                                    title,
+                                                },
+                                            );
+                                        } else {
+                                            last_click = Some((button, now, x, y));
+                                            let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
+                                                opt_cate: OptCate::鼠标,
+                                                opt_type: opt_type.label().to_string(),
+                                                x,
+                                                y,
+                                                hwnd,
+                                                title,
+                                            });
+                                        }
+                                    }
+                                } else if let EventType::Wheel { delta_y, .. } = event.event_type {
+                                    // 录制模式：滚轮上滑/下滑各记一行。
+                                    if listener_record_flag.load(Ordering::Acquire)
+                                        && delta_y != 0
+                                    {
+                                        let (x, y, hwnd, title) = cursor_info();
+                                        let opt_type = if delta_y > 0 {
+                                            MouseOptType::滚轮上滑
+                                        } else {
+                                            MouseOptType::滚轮下滑
+                                        };
+                                        let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
+                                            opt_cate: OptCate::鼠标,
+                                            opt_type: opt_type.label().to_string(),
+                                            x,
+                                            y,
+                                            hwnd,
+                                            title,
+                                        });
+                                    }
                                 } else if let EventType::KeyRelease(key) = event.event_type {
-                                    if matches!(key, RdevKey::ShiftLeft | RdevKey::ShiftRight) {
-                                        shift_pressed = false;
-                                    }
+                                    modifiers.update(&key, false);
                                 } else if let EventType::KeyPress(key) = event.event_type {
-                                    if matches!(key, RdevKey::ShiftLeft | RdevKey::ShiftRight) {
-                                        shift_pressed = true;
-                                    }
+                                    // 修饰键自己不成一次操作，只是记下状态供组合键使用。
+                                    let is_modifier = modifiers.update(&key, true);
                                     if key == RdevKey::CapsLock {
                                         caps_lock = !caps_lock;
                                     }
-                                    if let Some(row_ix) = *keyboard_input_row.lock().unwrap() {
-                                        let _ = mouse_tx.try_send(HotkeyEvent::KeyboardInput(
-                                            row_ix,
-                                            keyboard_key_label(&key, shift_pressed ^ caps_lock),
-                                        ));
+
+                                    // 快捷键按“修饰键 + 主键”的规范名比对：Ctrl+F8 不会
+                                    // 误触发只绑了 F8 的操作，大小写也不影响。
+                                    let pressed = hotkey_key_label(&modifiers, &key);
+
+                                    // 弹窗正在等新快捷键：这次按键只用来改绑定。
+                                    if listener_capture_flag.load(Ordering::Acquire) {
+                                        if !is_modifier {
+                                            listener_capture_flag
+                                                .store(false, Ordering::Release);
+                                            let _ =
+                                                mouse_tx.try_send(HotkeyEvent::HotkeyCaptured(
+                                                    pressed,
+                                                ));
+                                        }
                                         return;
                                     }
-                                    if key == RdevKey::F8 {
+
+                                    if let Some(row_ix) = *keyboard_input_row.lock().unwrap() {
+                                        if !is_modifier {
+                                            let _ = mouse_tx.try_send(HotkeyEvent::KeyboardInput(
+                                                row_ix,
+                                                keyboard_row_label(&modifiers, caps_lock, &key),
+                                            ));
+                                        }
+                                        return;
+                                    }
+
+                                    // 开始/暂停 和 开始录制 不受“监听热键”开关影响。
+                                    if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::ToggleRun,
+                                        &pressed,
+                                    ) {
                                         let _ = mouse_tx.try_send(HotkeyEvent::ToggleExecution);
+                                        return;
+                                    }
+                                    if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::Record,
+                                        &pressed,
+                                    ) {
+                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleRecording);
+                                        return;
+                                    }
+
+                                    // 录制中：除上面两个开关外，按下的键都记成一行键盘操作。
+                                    if listener_record_flag.load(Ordering::Acquire) {
+                                        if is_modifier {
+                                            return;
+                                        }
+                                        let (x, y, hwnd, title) = cursor_info();
+                                        let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
+                                            opt_cate: OptCate::键盘,
+                                            opt_type: keyboard_row_label(
+                                                &modifiers, caps_lock, &key,
+                                            ),
+                                            x,
+                                            y,
+                                            hwnd,
+                                            title,
+                                        });
+                                        return;
+                                    }
+
+                                    if is_modifier {
                                         return;
                                     }
                                     if !hotkey_listener_flag.load(Ordering::Acquire) {
                                         return;
                                     }
-                                    let (x, y, hwnd, title) = cursor_info();
-                                    match key {
-                                        RdevKey::F6 => {
-                                            let _ = mouse_tx
-                                                .try_send(HotkeyEvent::AddMouse(x, y, hwnd, title));
-                                        }
-                                        RdevKey::F7 => {
-                                            let _ = mouse_tx.try_send(HotkeyEvent::AddKeyboard(
-                                                x, y, hwnd, title,
-                                            ));
-                                        }
-                                        _ => {}
+                                    if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::MouseEvent,
+                                        &pressed,
+                                    ) {
+                                        let (x, y, hwnd, title) = cursor_info();
+                                        let _ = mouse_tx
+                                            .try_send(HotkeyEvent::AddMouse(x, y, hwnd, title));
+                                    } else if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::KeyboardEvent,
+                                        &pressed,
+                                    ) {
+                                        let (x, y, hwnd, title) = cursor_info();
+                                        let _ = mouse_tx.try_send(HotkeyEvent::AddKeyboard(
+                                            x, y, hwnd, title,
+                                        ));
                                     }
                                 }
                             };
@@ -1988,7 +3138,7 @@ fn main() {
                                                 view.finish_selection(window, cx);
                                             }
                                             HotkeyEvent::AddMouse(x, y, hwnd, title)
-                                                if view.watch_hotkey =>
+                                                if view.watch_hotkey && view.hotkey_modal.is_none() =>
                                             {
                                                 view.add_hotkey_row(
                                                     window,
@@ -1998,10 +3148,11 @@ fn main() {
                                                     hwnd,
                                                     title,
                                                     OptCate::鼠标,
+                                                    None,
                                                 );
                                             }
                                             HotkeyEvent::AddKeyboard(x, y, hwnd, title)
-                                                if view.watch_hotkey =>
+                                                if view.watch_hotkey && view.hotkey_modal.is_none() =>
                                             {
                                                 view.add_hotkey_row(
                                                     window,
@@ -2011,6 +3162,34 @@ fn main() {
                                                     hwnd,
                                                     title,
                                                     OptCate::键盘,
+                                                    None,
+                                                );
+                                            }
+                                            HotkeyEvent::ToggleRecording
+                                                if view.hotkey_modal.is_none() =>
+                                            {
+                                                view.toggle_recording(cx);
+                                            }
+                                            HotkeyEvent::HotkeyCaptured(key) => {
+                                                view.apply_captured_hotkey(key, cx);
+                                            }
+                                            HotkeyEvent::RecordedInput {
+                                                opt_cate,
+                                                opt_type,
+                                                x,
+                                                y,
+                                                hwnd,
+                                                title,
+                                            } => {
+                                                view.add_hotkey_row(
+                                                    window,
+                                                    cx,
+                                                    x,
+                                                    y,
+                                                    hwnd,
+                                                    title,
+                                                    opt_cate,
+                                                    Some(opt_type),
                                                 );
                                             }
                                             HotkeyEvent::KeyboardInput(row_ix, value) => {
@@ -2029,8 +3208,68 @@ fn main() {
                                                     }
                                                 });
                                             }
-                                            HotkeyEvent::ToggleExecution => {
+                                            // 修改快捷键的弹窗开着的时候，全局快捷键不生效：
+                                            // 否则刚按下的键会跑去做别的（比如开始点击）。
+                                            HotkeyEvent::ToggleExecution
+                                                if view.hotkey_modal.is_none() =>
+                                            {
                                                 view.toggle_execution(cx);
+                                            }
+                                            HotkeyEvent::RecordedDoubleClick {
+                                                opt_type,
+                                                x,
+                                                y,
+                                                hwnd,
+                                                title,
+                                            } => {
+                                                // 上一行就是这次单击，就地改成双击；
+                                                // 万一没对上（比如中间插了别的操作）就补一行。
+                                                let double_type =
+                                                    MouseOptType::from_label(&opt_type);
+                                                let upgraded = double_type.is_some_and(|kind| {
+                                                    view.data_table.update(cx, |table, _| {
+                                                        table
+                                                            .delegate_mut()
+                                                            .upgrade_last_mouse_row(kind, x, y)
+                                                    })
+                                                });
+                                                let Some(double_type) = double_type else {
+                                                    return;
+                                                };
+                                                if !upgraded {
+                                                    view.add_hotkey_row(
+                                                        window,
+                                                        cx,
+                                                        x,
+                                                        y,
+                                                        hwnd,
+                                                        title,
+                                                        OptCate::鼠标,
+                                                        Some(opt_type),
+                                                    );
+                                                    return;
+                                                }
+
+                                                // 行数据改了，下拉框的显示也要跟着改。
+                                                let select = view.data_table.update(cx, |table, _| {
+                                                    table
+                                                        .delegate()
+                                                        .opt_type_selects
+                                                        .last()
+                                                        .cloned()
+                                                });
+                                                if let Some(select) = select {
+                                                    select.update(cx, |select, cx| {
+                                                        select.set_selected_index(
+                                                            Some(IndexPath::new(
+                                                                double_type.index(),
+                                                            )),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                                cx.notify();
                                             }
                                             HotkeyEvent::ExecutionFinished => {
                                                 view.is_running = false;
@@ -2050,4 +3289,450 @@ fn main() {
         })
         .detach();
     });
+}
+
+/// 后台（SendMessage）双击路径的行为测试。
+/// 用系统自带的 EDIT 控件当靶子：它的窗口类带 CS_DBLCLKS，
+/// 而且双击在它身上的可观察结果很明确——选中光标下的整个单词，
+/// 单击则只移动插入符、不选中任何文字。
+#[cfg(test)]
+mod double_click_tests {
+    // 这里不用 `use super::*`：crate 根上 `use gpui::*` 会带进来 gpui 自己的
+    // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
+    use super::{
+        Duration, HWND, HotkeySettings, Instant, LPARAM, LEFT_DOUBLE_CLICK_LABEL,
+        MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OptCate,
+        SendMessageW, WPARAM, WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click,
+        double_click_gap, double_click_time_ms, hotkey_key_label, hotkey_keystroke,
+        is_double_click, is_left_double_click, keyboard_row_label, recorded_double_opt_type,
+        recorded_mouse_opt_type, send_message_mouse, split_keyboard_combo,
+    };
+    use rdev::{Button as RdevButton, Key as RdevKey};
+    use windows::core::w;
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, HMENU, SetWindowTextW, WINDOW_EX_STYLE, WS_POPUP,
+    };
+
+    // EM_GETSEL / EM_SETSEL 在 windows crate 的 Win32_UI_Controls 特性里，
+    // 为两个稳定的消息号单独开一个特性不划算，这里直接写消息号。
+    const EM_GETSEL: u32 = 0x00B0;
+    const EM_SETSEL: u32 = 0x00B1;
+
+    fn create_edit() -> HWND {
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!("hello world"),
+                WS_POPUP,
+                0,
+                0,
+                300,
+                40,
+                HWND::default(),
+                HMENU::default(),
+                HINSTANCE::default(),
+                None,
+            )
+            .expect("创建 EDIT 控件失败")
+        }
+    }
+
+    /// 当前选区的 (起点, 终点)。
+    fn selection(hwnd: HWND) -> (usize, usize) {
+        let result = unsafe { SendMessageW(hwnd, EM_GETSEL, WPARAM(0), LPARAM(0)) }.0 as usize;
+        (result & 0xffff, (result >> 16) & 0xffff)
+    }
+
+    fn collapse_selection(hwnd: HWND) {
+        unsafe {
+            let _ = SendMessageW(hwnd, EM_SETSEL, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    /// 一个鼠标行，坐标落在第一个单词 “hello” 上。
+    /// 一个鼠标行，坐标落在第一个单词 “hello” 上。
+    fn mouse_row(opt_type: &str) -> MyData {
+        MyData {
+            x: 6,
+            y: 10,
+            win_hwnd: String::new(),
+            opt_cate: OptCate::鼠标,
+            opt_type: opt_type.to_string(),
+            win_title: None,
+            delay: 0,
+            execute_time: 1,
+        }
+    }
+
+    /// 一个只有行数据的表格委托，用来测与窗口无关的行逻辑。
+    fn recorded_delegate(data: Vec<MyData>) -> MyTableDelegate {
+        MyTableDelegate {
+            data,
+            columns: Vec::new(),
+            delay_inputs: Vec::new(),
+            execute_time_inputs: Vec::new(),
+            opt_type_inputs: Vec::new(),
+            opt_cate_selects: Vec::new(),
+            opt_type_selects: Vec::new(),
+            delay_subscriptions: Vec::new(),
+            execute_time_subscriptions: Vec::new(),
+            opt_cate_subscriptions: Vec::new(),
+            opt_type_subscriptions: Vec::new(),
+            opt_type_select_subscriptions: Vec::new(),
+            focused_keyboard_row: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            expected_keyboard_value: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn left_double_click_sends_a_double_click_sequence() {
+        assert!(is_left_double_click(LEFT_DOUBLE_CLICK_LABEL));
+        assert!(!is_left_double_click("左键单击"));
+        assert!(!is_left_double_click("右键双击"));
+
+        let gap = double_click_gap();
+        assert!(gap >= Duration::from_millis(15));
+        assert!(gap.as_millis() as u64 * 2 < double_click_time_ms());
+
+        let hwnd = create_edit();
+        unsafe {
+            let _ = SetWindowTextW(hwnd, w!("hello world"));
+        }
+        assert!(
+            class_accepts_double_click(hwnd),
+            "EDIT 的窗口类应当带 CS_DBLCLKS"
+        );
+
+        // 左键单击：只移动插入符。
+        send_message_mouse(hwnd, &mouse_row("左键单击"));
+        let (click_start, click_end) = selection(hwnd);
+        assert_eq!(click_start, click_end, "单击不应该选中任何文字");
+
+        // 左键双击：选中光标下的整个单词。
+        collapse_selection(hwnd);
+        send_message_mouse(hwnd, &mouse_row(LEFT_DOUBLE_CLICK_LABEL));
+        let (start, end) = selection(hwnd);
+        assert!(end <= "hello world".len());
+        // 只断言选中了光标下的那个词：合成的鼠标消息没有真实移动过光标，
+        // EDIT 会把词后面的分隔符（空格）一起选进来，那属于控件自身的取舍。
+        assert!(end > start, "左键双击应当选中文字");
+        let selected = &"hello world"[start..end];
+        assert_eq!(
+            selected.trim_end(),
+            "hello",
+            "左键双击应当选中光标下的单词"
+        );
+
+        // 只发两次普通按下（缺少 WM_LBUTTONDBLCLK）不构成双击，
+        // 这正是 send_message_mouse 要按类样式分支的原因。
+        collapse_selection(hwnd);
+        let lparam = LPARAM((((10u32) << 16) | 6u32) as isize);
+        unsafe {
+            let _ = SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), lparam);
+            let _ = SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lparam);
+            let _ = SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), lparam);
+            let _ = SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lparam);
+        }
+        let (plain_start, plain_end) = selection(hwnd);
+        assert_eq!(
+            plain_start, plain_end,
+            "两次普通单击不是双击，不应该选中文字"
+        );
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    /// 下拉框里的七种操作方式：文案、还原、双击标记都要对得上，
+    /// 而且录制鼠标时写进表格的文案必须是这七种之一。
+    #[test]
+    fn every_mouse_opt_type_round_trips_through_its_label() {        assert_eq!(MOUSE_OPT_TYPE_LABELS.len(), MouseOptType::ALL.len());
+        assert_eq!(MOUSE_OPT_TYPE_LABELS[0].as_ref(), "左键单击");
+        assert_eq!(MOUSE_OPT_TYPE_LABELS[1].as_ref(), LEFT_DOUBLE_CLICK_LABEL);
+        assert_eq!(
+            MOUSE_OPT_TYPE_LABELS.last().unwrap().as_ref(),
+            "右键双击"
+        );
+
+        for kind in MouseOptType::ALL {
+            let label = kind.label().clone();
+            let restored = MouseOptType::from_label(&label).expect("文案应当能还原成操作方式");
+            assert_eq!(restored.index(), kind.index());
+            assert_eq!(restored.label().as_ref(), label.as_ref());
+        }
+
+        // 前后空格不影响还原，老数据里的空值和不认识的文案则保持 None。
+        assert_eq!(
+            MouseOptType::from_label(" 左键双击 "),
+            Some(MouseOptType::左键双击)
+        );
+        assert_eq!(MouseOptType::from_label(""), None);
+        assert_eq!(MouseOptType::from_label("鼠标乱点"), None);
+
+        assert!(MouseOptType::左键双击.is_double_click());
+        assert!(MouseOptType::右键双击.is_double_click());
+        assert!(!MouseOptType::左键单击.is_double_click());
+        assert!(!MouseOptType::滚轮上滑.is_double_click());
+
+        // 录制时按下鼠标键要落到真实存在的操作方式上。
+        use rdev::Button as RdevButton;
+        for button in [RdevButton::Left, RdevButton::Right, RdevButton::Middle] {
+            let kind = recorded_mouse_opt_type(button).expect("三个鼠标键都该有对应操作");
+            assert_eq!(MouseOptType::from_label(kind.label()), Some(kind));
+        }
+        assert_eq!(
+            recorded_mouse_opt_type(RdevButton::Left),
+            Some(MouseOptType::左键单击)
+        );
+        assert_eq!(
+            recorded_mouse_opt_type(RdevButton::Right),
+            Some(MouseOptType::右键单击)
+        );
+        assert_eq!(
+            recorded_mouse_opt_type(RdevButton::Middle),
+            Some(MouseOptType::滚轮单击)
+        );
+    }
+
+    /// 快捷键键名：修饰键顺序固定、字母统一大写，
+    /// 所以录制时写进去的绑定和按下时拼出来的键名一定对得上。
+    #[test]
+    fn hotkey_labels_cover_modifier_combinations() {
+        let none = ModifierState::default();
+        assert_eq!(hotkey_key_label(&none, &RdevKey::F8), "F8");
+        assert_eq!(hotkey_key_label(&none, &RdevKey::KeyA), "A");
+
+        let ctrl_shift = ModifierState {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let shift_ctrl = ModifierState {
+            shift: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(hotkey_key_label(&ctrl_shift, &RdevKey::KeyA), "CTRL+SHIFT+A");
+        // 和按下的先后顺序无关。
+        assert_eq!(
+            hotkey_key_label(&ctrl_shift, &RdevKey::KeyA),
+            hotkey_key_label(&shift_ctrl, &RdevKey::KeyA)
+        );
+
+        let all = ModifierState {
+            ctrl: true,
+            shift: true,
+            alt: true,
+            meta: true,
+        };
+        assert_eq!(hotkey_key_label(&all, &RdevKey::F1), "CTRL+SHIFT+ALT+WIN+F1");
+
+        // 绑定比对忽略大小写，但修饰键必须完全一致：Ctrl+F8 不该触发只绑了 F8 的操作。
+        assert!(HotkeySettings::matches("CTRL+SHIFT+A", "ctrl+shift+a"));
+        assert!(HotkeySettings::matches("F8", "f8"));
+        assert!(!HotkeySettings::matches("F8", "CTRL+F8"));
+        assert!(!HotkeySettings::matches("CTRL+F8", "F8"));
+    }
+
+    /// 组合键要能转成 gpui 显示的 Keystroke。
+    #[test]
+    fn hotkey_keystroke_understands_combinations() {
+        let stroke = hotkey_keystroke("CTRL+SHIFT+F1");
+        assert!(stroke.modifiers.control);
+        assert!(stroke.modifiers.shift);
+        assert!(!stroke.modifiers.alt);
+        assert_eq!(stroke.key, "f1");
+
+        let plain = hotkey_keystroke("F8");
+        assert_eq!(plain.key, "f8");
+        assert!(!plain.modifiers.control && !plain.modifiers.shift);
+
+        let win = hotkey_keystroke("WIN+A");
+        assert!(win.modifiers.platform);
+        assert_eq!(win.key, "a");
+    }
+
+    /// 表格里键盘操作保存的键名：普通打字保持可读，组合键写成显式前缀。
+    #[test]
+    fn keyboard_row_labels_keep_typing_readable_and_combinations_explicit() {
+        let none = ModifierState::default();
+        assert_eq!(keyboard_row_label(&none, false, &RdevKey::KeyA), "a");
+        assert_eq!(keyboard_row_label(&none, true, &RdevKey::KeyA), "A");
+        assert_eq!(keyboard_row_label(&none, false, &RdevKey::F5), "F5");
+        assert_eq!(keyboard_row_label(&none, false, &RdevKey::Num1), "1");
+
+        let shift = ModifierState {
+            shift: true,
+            ..Default::default()
+        };
+        // 字母的 Shift 已经体现在大小写里，不再写成 SHIFT+。
+        assert_eq!(keyboard_row_label(&shift, false, &RdevKey::KeyA), "A");
+        // 功能键、数字和符号则要显式带上 SHIFT，否则执行时打不出 Shift+1 这种字符。
+        assert_eq!(keyboard_row_label(&shift, false, &RdevKey::F5), "SHIFT+F5");
+        assert_eq!(keyboard_row_label(&shift, false, &RdevKey::Num1), "SHIFT+1");
+
+        let ctrl = ModifierState {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(keyboard_row_label(&ctrl, false, &RdevKey::KeyC), "CTRL+c");
+
+        // 组合键里 Shift 必须单独写出来：CTRL+SHIFT+A 和 CTRL+A 是两个快捷键。
+        let ctrl_shift = ModifierState {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keyboard_row_label(&ctrl_shift, false, &RdevKey::KeyA),
+            "CTRL+SHIFT+a"
+        );
+        assert_eq!(
+            keyboard_row_label(&ctrl_shift, false, &RdevKey::F5),
+            "CTRL+SHIFT+F5"
+        );
+
+        let ctrl_alt = ModifierState {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keyboard_row_label(&ctrl_alt, false, &RdevKey::Delete),
+            "CTRL+ALT+DELETE"
+        );
+    }
+
+    /// 写进表格的键盘操作要能再拆回修饰键 + 主键，执行时才发得出组合键。
+    #[test]
+    fn keyboard_combos_split_back_into_modifiers_and_key() {
+        assert_eq!(split_keyboard_combo("a"), (vec![], "a".to_string()));
+        assert_eq!(
+            split_keyboard_combo("CTRL+SHIFT+F5"),
+            (vec![0x11, 0x10], "F5".to_string())
+        );
+        assert_eq!(
+            split_keyboard_combo("CTRL+."),
+            (vec![0x11], ".".to_string())
+        );
+        // 认不出来的前缀忽略掉，主键照发。
+        assert_eq!(
+            split_keyboard_combo("FOO+ENTER"),
+            (vec![], "ENTER".to_string())
+        );
+        assert_eq!(split_keyboard_combo(""), (vec![], String::new()));
+    }
+
+    /// 修饰键自己不成一次操作，只用来拼组合键。
+    #[test]
+    fn modifier_state_tracks_keys_and_folds_into_labels() {
+        let mut modifiers = ModifierState::default();
+        assert!(modifiers.update(&RdevKey::ControlLeft, true));
+        assert!(modifiers.update(&RdevKey::ShiftRight, true));
+        assert!(!modifiers.update(&RdevKey::KeyA, true));
+        assert_eq!(hotkey_key_label(&modifiers, &RdevKey::KeyA), "CTRL+SHIFT+A");
+
+        assert!(modifiers.update(&RdevKey::ControlLeft, false));
+        assert!(!modifiers.ctrl);
+        assert!(modifiers.update(&RdevKey::AltGr, true));
+        assert!(modifiers.alt);
+    }
+
+    /// 录制时把两次快速点击并成双击的判定。
+    #[test]
+    fn double_click_needs_same_button_time_and_place() {
+        let now = Instant::now();
+        let previous = Some((RdevButton::Left, now, 100.0, 200.0));
+
+        assert!(is_double_click(
+            previous,
+            RdevButton::Left,
+            now + Duration::from_millis(50),
+            101.0,
+            201.0
+        ));
+        // 换了键、超时、位置跑远了都不算双击。
+        assert!(!is_double_click(
+            previous,
+            RdevButton::Right,
+            now + Duration::from_millis(50),
+            100.0,
+            200.0
+        ));
+        assert!(!is_double_click(
+            previous,
+            RdevButton::Left,
+            now + Duration::from_millis(double_click_time_ms() + 50),
+            100.0,
+            200.0
+        ));
+        assert!(!is_double_click(
+            previous,
+            RdevButton::Left,
+            now + Duration::from_millis(50),
+            160.0,
+            200.0
+        ));
+        assert!(!is_double_click(None, RdevButton::Left, now, 100.0, 200.0));
+
+        assert_eq!(
+            recorded_double_opt_type(RdevButton::Left),
+            Some(MouseOptType::左键双击)
+        );
+        assert_eq!(
+            recorded_double_opt_type(RdevButton::Right),
+            Some(MouseOptType::右键双击)
+        );
+        // 中键没有双击的说法，两次中键就是两行滚轮单击。
+        assert_eq!(recorded_double_opt_type(RdevButton::Middle), None);
+
+        // 双击 → 单击的对应关系，录制合并时用它认上一行。
+        assert_eq!(
+            MouseOptType::左键双击.single_click(),
+            Some(MouseOptType::左键单击)
+        );
+        assert_eq!(
+            MouseOptType::右键双击.single_click(),
+            Some(MouseOptType::右键单击)
+        );
+        assert_eq!(MouseOptType::左键单击.single_click(), None);
+        assert_eq!(MouseOptType::滚轮单击.single_click(), None);
+    }
+
+    /// 录制时把第二下点击并进上一行：只有“同一位置的同一次单击”才并得动。
+    #[test]
+    fn recorded_double_click_upgrades_the_matching_row() {
+        let mut delegate = recorded_delegate(vec![mouse_row("左键单击")]);
+        assert!(
+            delegate.upgrade_last_mouse_row(MouseOptType::左键双击, 6.0, 10.0),
+            "同一位置、同一按键的单击行应当能就地升级"
+        );
+        assert_eq!(delegate.data[0].opt_type, "左键双击");
+
+        // 位置差超过了系统双击范围就不并，宁可变回两行。
+        let mut delegate = recorded_delegate(vec![mouse_row("左键单击")]);
+        assert!(!delegate.upgrade_last_mouse_row(MouseOptType::左键双击, 100.0, 10.0));
+        assert_eq!(delegate.data[0].opt_type, "左键单击");
+
+        // 上一行是别的按键/别的类型（比如中间夹了一次滚轮）也不并。
+        let mut delegate = recorded_delegate(vec![mouse_row("滚轮上滑")]);
+        assert!(!delegate.upgrade_last_mouse_row(MouseOptType::左键双击, 6.0, 10.0));
+        assert_eq!(delegate.data[0].opt_type, "滚轮上滑");
+
+        // 上一行是键盘操作、或者干脆没有行，都并不了。
+        let mut keyboard_row = mouse_row("a");
+        keyboard_row.opt_cate = OptCate::键盘;
+        let mut delegate = recorded_delegate(vec![keyboard_row]);
+        assert!(!delegate.upgrade_last_mouse_row(MouseOptType::左键双击, 6.0, 10.0));
+        let mut delegate = recorded_delegate(vec![]);
+        assert!(!delegate.upgrade_last_mouse_row(MouseOptType::左键双击, 6.0, 10.0));
+
+        // 右键同理。
+        let mut delegate = recorded_delegate(vec![mouse_row("右键单击")]);
+        assert!(delegate.upgrade_last_mouse_row(MouseOptType::右键双击, 7.0, 10.0));
+        assert_eq!(delegate.data[0].opt_type, "右键双击");
+    }
 }
