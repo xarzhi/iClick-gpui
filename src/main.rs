@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW,
     SetCursorPos, SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW,
     WHEEL_DELTA, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL, WM_RBUTTONDBLCLK,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDBLCLK,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WindowFromPoint,
 };
 
@@ -105,11 +105,15 @@ enum HotkeyEvent {
     AddKeyboard(f64, f64, String, String),
     KeyboardInput(usize, String),
     ToggleExecution,
+    /// 操作二：开始/停止纯前台连点
+    ToggleOptTwo,
+    /// 操作二的连点已经点完（次数用完）
+    OptTwoFinished,
     /// 开始/停止录制
     ToggleRecording,
     /// 修改快捷键的弹窗捕获到的新快捷键
     HotkeyCaptured(String),
-    /// 录制中捕捉到的一次操作
+    /// 录制中捕捉到的一次操作。`delay` 是它距离上一个操作过了多少毫秒。
     RecordedInput {
         opt_cate: OptCate,
         opt_type: String,
@@ -117,14 +121,17 @@ enum HotkeyEvent {
         y: f64,
         hwnd: String,
         title: String,
+        delay: usize,
     },
-    /// 录制中把刚记下的那一次点击并成了双击
+    /// 录制中把刚记下的那一次点击并成了双击；`delay` 是第二次点击距上一次操作的间隔，
+    /// 只有当并进上一行失败、需要补一行时才会用到。
     RecordedDoubleClick {
         opt_type: String,
         x: f64,
         y: f64,
         hwnd: String,
         title: String,
+        delay: usize,
     },
     ExecutionFinished,
 }
@@ -150,6 +157,9 @@ pub struct IClick {
     record_flag: Arc<AtomicBool>,
     execution_flag: Arc<AtomicBool>,
     is_running: bool,
+    /// 操作二的连点是否正在跑。
+    opt_two_running: bool,
+    opt_two_flag: Arc<AtomicBool>,
     execution_event_tx: async_channel::Sender<HotkeyEvent>,
     is_choosing: bool,
     choosing_flag: Arc<AtomicBool>,
@@ -161,11 +171,10 @@ pub struct IClick {
     loop_count_input: Entity<InputState>,  // 循环次数
     fuzzy_round_input: Entity<InputState>, // 模糊范围
     loop_gap_ipt: Entity<InputState>,      // 循环间隔
-    opt_gap_ipt: Entity<InputState>,       // 循环间隔
-    // 操作二（纯前台连点）的输入框
-    click_hotkey_input: Entity<InputState>, // 开始/停止快捷键
-    click_gap_input: Entity<InputState>,    // 点击间隔
-    click_count_input: Entity<InputState>,  // 点击次数
+    opt_gap_ipt: Entity<InputState>,       // 操作间隔
+    // 操作二（纯前台连点）的输入框；开始/停止快捷键用的是全局快捷键，没有输入框。
+    click_gap_input: Entity<InputState>,   // 点击间隔
+    click_count_input: Entity<InputState>, // 点击次数
     _input_subscriptions: Vec<Subscription>,
     data_table: Entity<TableState<MyTableDelegate>>,
 }
@@ -195,13 +204,18 @@ pub enum MouseOptType {
     滚轮单击,
     右键单击,
     右键双击,
+    /// 只把光标移到这个点，不点（录制鼠标轨迹时用）
+    鼠标移动,
 }
 
 /// “操作方式”下拉框里左键双击的文案；它同时也是行数据里保存的值，
 /// 执行时按这个值判断该行要发一次单击还是双击。
 const LEFT_DOUBLE_CLICK_LABEL: &str = "左键双击";
 
-static MOUSE_OPT_TYPE_LABELS: LazyLock<[SharedString; 7]> = LazyLock::new(|| {
+/// 鼠标移动这一项在行数据里的文案。
+const MOUSE_MOVE_LABEL: &str = "鼠标移动";
+
+static MOUSE_OPT_TYPE_LABELS: LazyLock<[SharedString; 8]> = LazyLock::new(|| {
     [
         "左键单击".into(),
         LEFT_DOUBLE_CLICK_LABEL.into(),
@@ -210,12 +224,13 @@ static MOUSE_OPT_TYPE_LABELS: LazyLock<[SharedString; 7]> = LazyLock::new(|| {
         "滚轮单击".into(),
         "右键单击".into(),
         "右键双击".into(),
+        MOUSE_MOVE_LABEL.into(),
     ]
 });
 
 impl MouseOptType {
     /// 表格里的“操作方式”下拉框顺序，也是 [`MOUSE_OPT_TYPE_LABELS`] 的下标。
-    const ALL: [MouseOptType; 7] = [
+    const ALL: [MouseOptType; 8] = [
         Self::左键单击,
         Self::左键双击,
         Self::滚轮上滑,
@@ -223,6 +238,7 @@ impl MouseOptType {
         Self::滚轮单击,
         Self::右键单击,
         Self::右键双击,
+        Self::鼠标移动,
     ];
 
     fn index(&self) -> usize {
@@ -234,6 +250,7 @@ impl MouseOptType {
             Self::滚轮单击 => 4,
             Self::右键单击 => 5,
             Self::右键双击 => 6,
+            Self::鼠标移动 => 7,
         }
     }
 
@@ -275,7 +292,7 @@ impl SelectItem for MouseOptType {
     }
 }
 
-/// 操作一里可以自定义的四个全局快捷键。
+/// 可以自定义的全局快捷键。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HotkeyAction {
     /// 开始录制
@@ -286,14 +303,17 @@ enum HotkeyAction {
     MouseEvent,
     /// 把鼠标当前位置记成一行键盘操作
     KeyboardEvent,
+    /// 操作二：开始/停止纯前台连点
+    OptTwoRun,
 }
 
 impl HotkeyAction {
-    const ALL: [HotkeyAction; 4] = [
+    const ALL: [HotkeyAction; 5] = [
         HotkeyAction::Record,
         HotkeyAction::ToggleRun,
         HotkeyAction::MouseEvent,
         HotkeyAction::KeyboardEvent,
+        HotkeyAction::OptTwoRun,
     ];
 
     fn default_key(self) -> &'static str {
@@ -302,6 +322,7 @@ impl HotkeyAction {
             Self::ToggleRun => "F8",
             Self::MouseEvent => "F6",
             Self::KeyboardEvent => "F7",
+            Self::OptTwoRun => "F9",
         }
     }
 
@@ -312,11 +333,12 @@ impl HotkeyAction {
             Self::ToggleRun => "开始/暂停",
             Self::MouseEvent => "鼠标事件",
             Self::KeyboardEvent => "键盘事件",
+            Self::OptTwoRun => "操作二开始/停止",
         }
     }
 }
 
-/// 四个快捷键当前的绑定，键名和 [`keyboard_key_label`] 给出的标签一致（如 "F8"、"A"）。
+/// 五个快捷键当前的绑定，键名和 [`keyboard_key_label`] 给出的标签一致（如 "F8"、"A"）。
 ///
 /// 这份配置被监听线程共享：每次按键都现读现比，所以弹窗里改完（重新注册）
 /// 下一次按键就按新绑定走，不需要另外向系统注销/注册热键。
@@ -326,6 +348,7 @@ struct HotkeySettings {
     toggle_run: String,
     mouse_event: String,
     keyboard_event: String,
+    opt_two_run: String,
 }
 
 impl Default for HotkeySettings {
@@ -335,6 +358,7 @@ impl Default for HotkeySettings {
             toggle_run: HotkeyAction::ToggleRun.default_key().to_string(),
             mouse_event: HotkeyAction::MouseEvent.default_key().to_string(),
             keyboard_event: HotkeyAction::KeyboardEvent.default_key().to_string(),
+            opt_two_run: HotkeyAction::OptTwoRun.default_key().to_string(),
         }
     }
 }
@@ -346,6 +370,7 @@ impl HotkeySettings {
             HotkeyAction::ToggleRun => &self.toggle_run,
             HotkeyAction::MouseEvent => &self.mouse_event,
             HotkeyAction::KeyboardEvent => &self.keyboard_event,
+            HotkeyAction::OptTwoRun => &self.opt_two_run,
         }
     }
 
@@ -355,6 +380,7 @@ impl HotkeySettings {
             HotkeyAction::ToggleRun => &mut self.toggle_run,
             HotkeyAction::MouseEvent => &mut self.mouse_event,
             HotkeyAction::KeyboardEvent => &mut self.keyboard_event,
+            HotkeyAction::OptTwoRun => &mut self.opt_two_run,
         }
     }
 
@@ -456,6 +482,12 @@ fn hotkey_key_label(modifiers: &ModifierState, key: &RdevKey) -> String {
     parts.join("+")
 }
 
+/// 只按“是哪个键”算出来的键名，不带修饰键。
+/// 用来记「这个键已经被当成快捷键用掉了」，等它弹起时不再写进表格。
+fn plain_key_label(key: &RdevKey) -> String {
+    hotkey_key_label(&ModifierState::default(), key)
+}
+
 /// 表格里“键盘操作”保存的键名。普通打字保留原样的字符（大小写跟着 Shift/CapsLock 走），
 /// 组合键写成 "CTRL+SHIFT+a"、"SHIFT+F5"，执行时按组合键发出去。
 fn keyboard_row_label(modifiers: &ModifierState, caps_lock: bool, key: &RdevKey) -> String {
@@ -476,6 +508,51 @@ fn keyboard_row_label(modifiers: &ModifierState, caps_lock: bool, key: &RdevKey)
     let mut parts = modifiers.prefixes(!folded_into_case);
     parts.push(&base);
     parts.join("+")
+}
+
+/// 键盘操作的动作：录制的按下和弹起是两行，手填的键名默认按一整个按键（按下+弹起）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KeyAction {
+    /// 按下 + 弹起（不写前缀时的默认）
+    Press,
+    /// 只按下
+    Down,
+    /// 只弹起
+    Up,
+}
+
+impl KeyAction {
+    /// 表格里写在键名前面的前缀。
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Press => "",
+            Self::Down => "按下 ",
+            Self::Up => "弹起 ",
+        }
+    }
+}
+
+/// 把表格里的键盘操作拆成（动作, 剩下的键名）。
+/// "按下 a" → (Down, "a")；"弹起 CTRL" → (Up, "CTRL")；"a" → (Press, "a")。
+fn split_key_action(label: &str) -> (KeyAction, &str) {
+    let label = label.trim();
+    if let Some(rest) = label.strip_prefix("按下") {
+        return (KeyAction::Down, rest.trim());
+    }
+    if let Some(rest) = label.strip_prefix("弹起") {
+        return (KeyAction::Up, rest.trim());
+    }
+    (KeyAction::Press, label)
+}
+
+/// 录制键盘事件时写进表格的文案：每个按下、弹起都各记一行，
+/// 修饰键（CTRL/SHIFT/ALT）自己也会被记成普通行，所以这里只写物理键名。
+fn recorded_key_label(action: KeyAction, caps_lock: bool, key: &RdevKey) -> String {
+    format!(
+        "{}{}",
+        action.prefix(),
+        keyboard_key_label(key, caps_lock)
+    )
 }
 
 /// 把表格里的键盘操作拆成（修饰键虚拟键码, 主键名）。没有组合时修饰键是空的。
@@ -620,8 +697,9 @@ fn waits_between_loops(loop_count: usize, completed_loops: usize) -> bool {
 
 /// 分片等待：中途被暂停（execution_flag 清零）就立刻返回 false，
 /// 不会因为「循环间隔」填得很大而让暂停按钮像失灵一样。
+/// 分片要短：暂停后最多再等一片就退出。
 fn sleep_until_stopped(execution_flag: &Arc<AtomicBool>, duration: Duration) -> bool {
-    const SLICE: Duration = Duration::from_millis(20);
+    const SLICE: Duration = Duration::from_millis(10);
     let mut slept = Duration::ZERO;
     while slept < duration {
         if !execution_flag.load(Ordering::Acquire) {
@@ -659,6 +737,44 @@ impl OperationGap {
             0
         }
     }
+}
+
+/// 操作二连点要不要继续：还按着快捷键、并且次数没用完。
+/// 点击次数为 0 表示一直点，直到再按一次快捷键停下。
+fn keeps_clicking(running: bool, click_count: usize, clicked: usize) -> bool {
+    running && (click_count == 0 || clicked < click_count)
+}
+
+/// 操作二的每一次点击：在当前鼠标位置注入一次真实左键点击。
+/// 用的是 SendInput，所以点到的就是光标下面那个窗口，光标本身不动。
+fn click_at_cursor() {
+    send_input_click(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
+}
+
+/// 录制时算「这一步离上一步过了多久」，直接当成这一行的延迟。
+/// 第一条没有上一步，延迟是 0（不然回放时会先干等一段开始前的发呆时间）。
+fn take_recorded_delay(last: &mut Option<Instant>, now: Instant) -> usize {
+    let delay = last.map_or(0, |previous| {
+        now.duration_since(previous).as_millis() as usize
+    });
+    *last = Some(now);
+    delay
+}
+
+/// 录制鼠标轨迹时的抽稀条件：位移够大、并且离上次记录够久才再记一行。
+/// 鼠标移动事件一秒能来几百条，全记下来表格会被瞬间刷爆。
+const MOVE_RECORD_MIN_DISTANCE: f64 = 4.0;
+const MOVE_RECORD_MIN_INTERVAL: Duration = Duration::from_millis(25);
+
+/// 这一次鼠标移动要不要记成一行。
+fn should_record_move(last: Option<(Instant, f64, f64)>, now: Instant, x: f64, y: f64) -> bool {
+    let Some((last_time, last_x, last_y)) = last else {
+        return true;
+    };
+    if now.duration_since(last_time) < MOVE_RECORD_MIN_INTERVAL {
+        return false;
+    }
+    (x - last_x).abs() >= MOVE_RECORD_MIN_DISTANCE || (y - last_y).abs() >= MOVE_RECORD_MIN_DISTANCE
 }
 
 #[derive(Clone, Debug)]
@@ -1311,6 +1427,18 @@ impl IClick {
                             break;
                         }
 
+                        // 这一行自己的延迟：录制出来的值就是「距上一个操作过了多久」，
+                        // 所以先等它，再等全局的操作间隔，然后才发这次操作。
+                        // 这样回放的节奏和录制时一致，最后一行也不会多等一次。
+                        if row.delay > 0
+                            && !sleep_until_stopped(
+                                &execution_flag,
+                                Duration::from_millis(row.delay as u64),
+                            )
+                        {
+                            break;
+                        }
+
                         // 操作间隔：上一个操作和这一个之间的间隔。
                         let wait = operation_gap.wait_before_operation();
                         if wait > 0
@@ -1325,15 +1453,6 @@ impl IClick {
                         // 一次点击取一个点：双击的两次点按共用它，否则就不是双击了。
                         let point = fuzzy_point(row.x, row.y, fuzzy_range, &mut random_seed);
                         send_row_input(hwnd, row, front_opt, point);
-                        // 行自己的延迟照旧，跟在这次操作后面。
-                        if row.delay > 0
-                            && !sleep_until_stopped(
-                                &execution_flag,
-                                Duration::from_millis(row.delay as u64),
-                            )
-                        {
-                            break;
-                        }
                     }
                 }
                 if !execution_flag.load(Ordering::Acquire) {
@@ -1377,6 +1496,10 @@ impl IClick {
         }
     }
 
+    /// 往表格里加一行。`delay` 就是这一行的「延迟(ms)」：
+    /// 执行这一行之前先等这么久。录制出来的行填的是它距离上一步真实过去的时间，
+    /// 热键插的行是 0。
+    #[allow(clippy::too_many_arguments)]
     fn add_hotkey_row(
         &mut self,
         window: &mut Window,
@@ -1387,6 +1510,7 @@ impl IClick {
         title: String,
         opt_cate: OptCate,
         opt_type: Option<String>,
+        delay: usize,
     ) {
         self.x_input.update(cx, |input, cx| {
             input.set_value(&(x.round() as usize).to_string(), window, cx);
@@ -1407,7 +1531,7 @@ impl IClick {
             opt_cate,
             opt_type,
             win_title: Some(title),
-            delay: 0,
+            delay,
             execute_time: 1,
         };
         self.data_table.update(cx, |table, cx| {
@@ -1535,6 +1659,55 @@ impl IClick {
         cx.notify();
     }
 
+    /// 操作二的开始/停止：在当前鼠标位置连点，次数用完自己停，
+    /// 点击次数填 0 就一直点，直到再按一次快捷键。
+    fn toggle_opt_two(&mut self, cx: &mut Context<Self>) {
+        if self.opt_two_running {
+            self.opt_two_running = false;
+            self.opt_two_flag.store(false, Ordering::Release);
+            cx.notify();
+            return;
+        }
+
+        let click_count = self
+            .click_count_input
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(0);
+        let interval = self
+            .click_gap_input
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(0);
+
+        self.opt_two_running = true;
+        self.opt_two_flag.store(true, Ordering::Release);
+        let running = self.opt_two_flag.clone();
+        let event_tx = self.execution_event_tx.clone();
+        thread::spawn(move || {
+            let mut clicked = 0usize;
+            while keeps_clicking(running.load(Ordering::Acquire), click_count, clicked) {
+                click_at_cursor();
+                clicked += 1;
+
+                // 还有下一击才等点击间隔；次数用完就直接收工。
+                if !keeps_clicking(running.load(Ordering::Acquire), click_count, clicked) {
+                    break;
+                }
+                if interval > 0
+                    && !sleep_until_stopped(&running, Duration::from_millis(interval as u64))
+                {
+                    break;
+                }
+            }
+            running.store(false, Ordering::Release);
+            let _ = event_tx.try_send(HotkeyEvent::OptTwoFinished);
+        });
+        cx.notify();
+    }
+
     /// 修改快捷键的弹窗：铺满窗口的遮罩 + 居中的小面板。
     /// 遮罩自己不响应点击（只挡住下面的表格），关掉弹窗要点“取消”。
     fn render_hotkey_modal(&mut self, modal: &HotkeyModal, cx: &mut Context<Self>) -> AnyElement {
@@ -1649,8 +1822,9 @@ impl IClick {
             .into_any_element()
     }
 
-    /// 操作二：纯前台连点，先按截图把界面摆出来。
-    fn render_opt_two(&mut self, _cx: &mut Context<Self>) -> Div {
+    /// 操作二：纯前台连点。开始/停止快捷键和操作一那几个一样，
+    /// 点小标签就能开弹窗改绑定。
+    fn render_opt_two(&mut self, cx: &mut Context<Self>) -> Div {
         div()
             .size_full()
             .bg(rgb(0xf6f6f6))
@@ -1671,8 +1845,22 @@ impl IClick {
                     .child(
                         div()
                             .ml(px(8.0))
-                            .w(px(88.0))
-                            .child(Input::new(&self.click_hotkey_input).small().text_size(px(12.0))),
+                            .id("hotkey_opt_two")
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_hotkey_modal(HotkeyAction::OptTwoRun, cx);
+                            }))
+                            .child(self.hotkey_kbd(HotkeyAction::OptTwoRun)),
+                    )
+                    .child(
+                        div()
+                            .ml(px(10.0))
+                            .text_color(rgb(0x1f44fa))
+                            .child(if self.opt_two_running {
+                                "连点中，再按一次停止"
+                            } else {
+                                ""
+                            }),
                     ),
             )
             .child(
@@ -1699,6 +1887,13 @@ impl IClick {
                             .ml(px(8.0))
                             .w(px(46.0))
                             .child(Input::new(&self.click_count_input).small().text_size(px(12.0))),
+                    )
+                    .child(
+                        div()
+                            .ml(px(6.0))
+                            .text_size(px(12.0))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("0 表示一直点"),
                     ),
             )
     }
@@ -1899,16 +2094,22 @@ fn key_input(vk: usize, key_up: bool) -> INPUT {
     }
 }
 
-fn send_input_key(hwnd: HWND, key: &str) {
+/// 需要的话把目标窗口切到前台。已经在最前面就不要再调 SetForegroundWindow：
+/// 这个调用在窗口不愿让出焦点时可能阻塞很久，而连点是一击一次，卡一次就慢一拍。
+fn ensure_foreground(hwnd: HWND) {
     unsafe {
         let top_level = GetAncestor(hwnd, GA_ROOT);
-        let _ = SetForegroundWindow(if top_level.0.is_null() {
-            hwnd
-        } else {
-            top_level
-        });
+        let target = if top_level.0.is_null() { hwnd } else { top_level };
+        if GetForegroundWindow() != target {
+            let _ = SetForegroundWindow(target);
+        }
     }
+}
 
+fn send_input_key(hwnd: HWND, key: &str) {
+    ensure_foreground(hwnd);
+
+    let (action, key) = split_key_action(key);
     let (modifiers, base) = split_keyboard_combo(key);
     // 单个字符且不带修饰键：直接注入字符，中文、标点都发得出去。
     let is_character = modifiers.is_empty() && base.chars().count() == 1;
@@ -1916,11 +2117,17 @@ fn send_input_key(hwnd: HWND, key: &str) {
         let Some(vk) = keyboard_virtual_key_for(&base) else {
             return;
         };
-        // 组合键：修饰键按下 → 主键按下抬起 → 修饰键反序抬起。
-        let mut inputs: Vec<INPUT> = modifiers.iter().map(|vk| key_input(*vk, false)).collect();
-        inputs.push(key_input(vk, false));
-        inputs.push(key_input(vk, true));
-        inputs.extend(modifiers.iter().rev().map(|vk| key_input(*vk, true)));
+        // 组合键：修饰键按下 → 主键按下（抬起）→ 修饰键反序抬起。
+        // 「只按下」不补抬起，「只弹起」不补按下，这样录制出来的按住过程能还原。
+        let mut inputs: Vec<INPUT> = Vec::new();
+        if action != KeyAction::Up {
+            inputs.extend(modifiers.iter().map(|vk| key_input(*vk, false)));
+            inputs.push(key_input(vk, false));
+        }
+        if action != KeyAction::Down {
+            inputs.push(key_input(vk, true));
+            inputs.extend(modifiers.iter().rev().map(|vk| key_input(*vk, true)));
+        }
         inputs
     } else {
         key.encode_utf16()
@@ -2009,13 +2216,13 @@ fn send_input_wheel(delta: i32) {
 /// 第二组会被系统自身的双击判定识别，并自动合成 WM_*BUTTONDBLCLK，
 /// 所以这里不需要（也不应该）自己补发那条消息。
 fn send_input_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
+    ensure_foreground(hwnd);
     unsafe {
         let mut cursor = POINT {
             x: point.0 as i32,
             y: point.1 as i32,
         };
         let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut cursor);
-        let _ = SetForegroundWindow(hwnd);
         let _ = SetCursorPos(cursor.x, cursor.y);
     }
 
@@ -2037,6 +2244,8 @@ fn send_input_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
             send_input_wheel(-(WHEEL_DELTA as i32));
             return;
         }
+        // 鼠标移动就是把光标挪过去（上面已经 SetCursorPos），不点。
+        MouseOptType::鼠标移动 => return,
     };
 
     // 一次单击 = 按下 + 抬起，一次 SendInput 注入一组完整点按。
@@ -2079,6 +2288,14 @@ fn send_message_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
     let y = (point.1 as u32) & 0xffff;
     let lparam = LPARAM(((y << 16) | x) as isize);
 
+    // 鼠标移动：只给目标窗口发一条 WM_MOUSEMOVE。
+    if opt_type == MouseOptType::鼠标移动 {
+        unsafe {
+            let _ = SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam);
+        }
+        return;
+    }
+
     // 三种按键各自的按下/抬起/双击消息，以及按下时 wParam 里的按钮标志。
     let (down_message, up_message, double_message, button_flag) = match opt_type {
         MouseOptType::左键单击 | MouseOptType::左键双击 => (
@@ -2100,6 +2317,7 @@ fn send_message_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
             MK_MBUTTON,
         ),
         MouseOptType::滚轮上滑 | MouseOptType::滚轮下滑 => unreachable!("滚轮上面已经返回"),
+        MouseOptType::鼠标移动 => unreachable!("鼠标移动上面已经返回"),
     };
 
     unsafe {
@@ -2173,9 +2391,12 @@ fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool, point: (usize, usiz
                     return;
                 }
 
-                let (modifiers, base) = split_keyboard_combo(&row.opt_type);
-                // 单个字符且不带修饰键：老规矩，直接发字符消息。
-                if modifiers.is_empty() && base.chars().count() == 1 {
+                let (action, key_text) = split_key_action(&row.opt_type);
+                let (modifiers, base) = split_keyboard_combo(key_text);
+                // 单个字符、不带修饰键、而且是完整一按：老规矩，直接发字符消息。
+                let plain_character =
+                    action == KeyAction::Press && modifiers.is_empty() && base.chars().count() == 1;
+                if plain_character {
                     for unit in base.encode_utf16() {
                         let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
                     }
@@ -2187,33 +2408,39 @@ fn send_row_input(hwnd: HWND, row: &MyData, front_opt: bool, point: (usize, usiz
                     }
                     return;
                 };
-                // 组合键：修饰键按下 → 主键按下抬起 → 修饰键反序抬起。
-                for modifier in &modifiers {
+                // 组合键：修饰键按下 → 主键按下（抬起）→ 修饰键反序抬起；
+                // 「只按下」/「只弹起」按录制的语义只发一半。
+                let wparam = WPARAM(key);
+                if action != KeyAction::Up {
+                    for modifier in &modifiers {
+                        let _ = SendMessageW(
+                            hwnd,
+                            WM_KEYDOWN,
+                            WPARAM(*modifier),
+                            keyboard_message_lparam(*modifier, false),
+                        );
+                    }
                     let _ = SendMessageW(
                         hwnd,
                         WM_KEYDOWN,
-                        WPARAM(*modifier),
-                        keyboard_message_lparam(*modifier, false),
+                        wparam,
+                        keyboard_message_lparam(key, false),
                     );
+                    if key == 0x0D {
+                        let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(0x0D), LPARAM(0));
+                    }
                 }
-                let wparam = WPARAM(key);
-                let _ = SendMessageW(
-                    hwnd,
-                    WM_KEYDOWN,
-                    wparam,
-                    keyboard_message_lparam(key, false),
-                );
-                if key == 0x0D {
-                    let _ = SendMessageW(hwnd, WM_CHAR, WPARAM(0x0D), LPARAM(0));
-                }
-                let _ = SendMessageW(hwnd, WM_KEYUP, wparam, keyboard_message_lparam(key, true));
-                for modifier in modifiers.iter().rev() {
-                    let _ = SendMessageW(
-                        hwnd,
-                        WM_KEYUP,
-                        WPARAM(*modifier),
-                        keyboard_message_lparam(*modifier, true),
-                    );
+                if action != KeyAction::Down {
+                    let _ =
+                        SendMessageW(hwnd, WM_KEYUP, wparam, keyboard_message_lparam(key, true));
+                    for modifier in modifiers.iter().rev() {
+                        let _ = SendMessageW(
+                            hwnd,
+                            WM_KEYUP,
+                            WPARAM(*modifier),
+                            keyboard_message_lparam(*modifier, true),
+                        );
+                    }
                 }
             }
         }
@@ -2988,9 +3215,7 @@ fn main() {
                         });
                         let win_hwnd_input = cx.new(|cx| InputState::new(window, cx));
                         let win_title_input = cx.new(|cx| InputState::new(window, cx));
-                        // 操作二（纯前台连点）的三个输入框
-                        let click_hotkey_input =
-                            cx.new(|cx| InputState::new(window, cx).default_value("F9"));
+                        // 操作二（纯前台连点）的输入框；开始/停止快捷键走全局快捷键
                         let click_gap_input = cx.new(|cx| {
                             InputState::new(window, cx)
                                 .default_value("20")
@@ -3010,7 +3235,6 @@ fn main() {
                             subscribe_select_all(&y_input, cx),
                             subscribe_select_all(&win_hwnd_input, cx),
                             subscribe_select_all(&win_title_input, cx),
-                            subscribe_select_all(&click_hotkey_input, cx),
                             subscribe_select_all(&click_gap_input, cx),
                             subscribe_select_all(&click_count_input, cx),
                         ];
@@ -3029,6 +3253,7 @@ fn main() {
                         let hotkey_flag = Arc::new(AtomicBool::new(true));
                         let execution_flag = Arc::new(AtomicBool::new(false));
                         let record_flag = Arc::new(AtomicBool::new(false));
+                        let opt_two_flag = Arc::new(AtomicBool::new(false));
                         let hotkeys = Arc::new(std::sync::Mutex::new(HotkeySettings::default()));
                         let hotkey_capture_flag = Arc::new(AtomicBool::new(false));
                         let (mouse_tx, mouse_rx) = async_channel::unbounded::<HotkeyEvent>();
@@ -3059,6 +3284,8 @@ fn main() {
                             record_flag: record_flag.clone(),
                             execution_flag: execution_flag.clone(),
                             is_running: false,
+                            opt_two_running: false,
+                            opt_two_flag: opt_two_flag.clone(),
                             execution_event_tx: mouse_tx.clone(),
                             is_choosing: false,
                             choosing_flag: choosing_flag.clone(),
@@ -3067,7 +3294,6 @@ fn main() {
                             y_input,
                             win_hwnd_input,
                             win_title_input,
-                            click_hotkey_input,
                             click_gap_input,
                             click_count_input,
                         });
@@ -3076,12 +3302,21 @@ fn main() {
                         let listener_hotkeys = hotkeys.clone();
                         let listener_capture_flag = hotkey_capture_flag.clone();
                         let listener_record_flag = record_flag.clone();
+                        let listener_execution_flag = execution_flag.clone();
+                        let listener_opt_two_flag = opt_two_flag.clone();
                         let keyboard_input_row = focused_keyboard_row.clone();
                         std::thread::spawn(move || {
                             let mut modifiers = ModifierState::default();
                             let mut caps_lock = false;
                             // 录制时用来把两次快速点击并成一次双击。
                             let mut last_click: Option<(RdevButton, Instant, f64, f64)> = None;
+                            // 录制时用来给鼠标轨迹抽稀：位置没怎么动就不记。
+                            let mut last_move: Option<(Instant, f64, f64)> = None;
+                            // 已经当成快捷键用掉的按键（键名不带修饰键），
+                            // 它们弹起时不再往表格里写。
+                            let mut hotkey_keys_down: Vec<String> = Vec::new();
+                            // 上一个被记下的操作发生的时刻，用来算每行的「延迟」。
+                            let mut last_recorded_at: Option<Instant> = None;
                             let callback = move |event: Event| {
                                 if listener_flag.load(Ordering::Acquire)
                                     && let EventType::MouseMove { x: _, y: _ } = event.event_type
@@ -3096,6 +3331,27 @@ fn main() {
                                 {
                                     set_selection_cursor(false);
                                     let _ = mouse_tx.try_send(HotkeyEvent::MouseReleased);
+                                } else if let EventType::MouseMove { x, y } = event.event_type {
+                                    // 录制模式：把鼠标轨迹也记成行。
+                                    // 鼠标移动事件一秒能来几百条，所以按「距离 + 间隔」抽稀，
+                                    // 不然表格会被瞬间刷爆。
+                                    if listener_record_flag.load(Ordering::Acquire) {
+                                        let now = Instant::now();
+                                        if should_record_move(last_move, now, x, y) {
+                                            let (client_x, client_y, hwnd, title) = cursor_info();
+                                            last_move = Some((now, x, y));
+                                            let delay = take_recorded_delay(&mut last_recorded_at, now);
+                                            let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
+                                                opt_cate: OptCate::鼠标,
+                                                opt_type: MOUSE_MOVE_LABEL.to_string(),
+                                                x: client_x,
+                                                y: client_y,
+                                                hwnd,
+                                                title,
+                                                delay,
+                                            });
+                                        }
+                                    }
                                 } else if let EventType::ButtonPress(button) = event.event_type {
                                     // 录制模式：把鼠标操作记成表格里的行，
                                     // 同一个键快速点两下就并成一次双击。
@@ -3104,6 +3360,7 @@ fn main() {
                                     {
                                         let (x, y, hwnd, title) = cursor_info();
                                         let now = Instant::now();
+                                        let delay = take_recorded_delay(&mut last_recorded_at, now);
                                         if let Some(double_type) = recorded_double_opt_type(button)
                                             && is_double_click(last_click, button, now, x, y)
                                         {
@@ -3115,6 +3372,7 @@ fn main() {
                                                     y,
                                                     hwnd,
                                                     title,
+                                                    delay,
                                                 },
                                             );
                                         } else {
@@ -3126,6 +3384,7 @@ fn main() {
                                                 y,
                                                 hwnd,
                                                 title,
+                                                delay,
                                             });
                                         }
                                     }
@@ -3140,6 +3399,8 @@ fn main() {
                                         } else {
                                             MouseOptType::滚轮下滑
                                         };
+                                        let delay =
+                                            take_recorded_delay(&mut last_recorded_at, Instant::now());
                                         let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
                                             opt_cate: OptCate::鼠标,
                                             opt_type: opt_type.label().to_string(),
@@ -3147,10 +3408,38 @@ fn main() {
                                             y,
                                             hwnd,
                                             title,
+                                            delay,
                                         });
                                     }
                                 } else if let EventType::KeyRelease(key) = event.event_type {
                                     modifiers.update(&key, false);
+
+                                    // 录制模式：弹起也记一行「弹起 xxx」。
+                                    // 被当成快捷键用掉的那次按键，弹起时不再写进表格。
+                                    let plain_key = plain_key_label(&key);
+                                    let consumed = hotkey_keys_down
+                                        .iter()
+                                        .position(|candidate| *candidate == plain_key);
+                                    if let Some(position) = consumed {
+                                        hotkey_keys_down.remove(position);
+                                    } else if listener_record_flag.load(Ordering::Acquire) {
+                                        let (x, y, hwnd, title) = cursor_info();
+                                        let delay =
+                                            take_recorded_delay(&mut last_recorded_at, Instant::now());
+                                        let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
+                                            opt_cate: OptCate::键盘,
+                                            opt_type: recorded_key_label(
+                                                KeyAction::Up,
+                                                caps_lock,
+                                                &key,
+                                            ),
+                                            x,
+                                            y,
+                                            hwnd,
+                                            title,
+                                            delay,
+                                        });
+                                    }
                                 } else if let EventType::KeyPress(key) = event.event_type {
                                     // 修饰键自己不成一次操作，只是记下状态供组合键使用。
                                     let is_modifier = modifiers.update(&key, true);
@@ -3161,6 +3450,8 @@ fn main() {
                                     // 快捷键按“修饰键 + 主键”的规范名比对：Ctrl+F8 不会
                                     // 误触发只绑了 F8 的操作，大小写也不影响。
                                     let pressed = hotkey_key_label(&modifiers, &key);
+                                    // 不带修饰键的键名，用来记「这个键被快捷键用掉了」。
+                                    let plain_key = plain_key_label(&key);
 
                                     // 弹窗正在等新快捷键：这次按键只用来改绑定。
                                     if listener_capture_flag.load(Ordering::Acquire) {
@@ -3175,6 +3466,47 @@ fn main() {
                                         return;
                                     }
 
+                                    // 开始/暂停、操作二连点、开始录制 是全局开关，优先级最高：
+                                    //   1) 永远不受「监听热键」开关影响；
+                                    //   2) 也永远排在「键盘行的输入框正在等着录键」前面——
+                                    //      否则焦点留在某一行的操作方式上时，F8 会被当成字符写进那一行，
+                                    //      结果就是「按了暂停却还在跑」。
+                                    // 开始/暂停 还要当场把执行标志清掉：不等界面把事件处理完，
+                                    // 正在跑的那一轮立刻停（界面慢或卡住都不影响停止）。
+                                    if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::ToggleRun,
+                                        &pressed,
+                                    ) {
+                                        hotkey_keys_down.push(plain_key.clone());
+                                        if listener_execution_flag.load(Ordering::Acquire) {
+                                            listener_execution_flag.store(false, Ordering::Release);
+                                        }
+                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleExecution);
+                                        return;
+                                    }
+                                    if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::OptTwoRun,
+                                        &pressed,
+                                    ) {
+                                        hotkey_keys_down.push(plain_key.clone());
+                                        if listener_opt_two_flag.load(Ordering::Acquire) {
+                                            listener_opt_two_flag.store(false, Ordering::Release);
+                                        }
+                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleOptTwo);
+                                        return;
+                                    }
+                                    if hotkey_pressed(
+                                        &listener_hotkeys,
+                                        HotkeyAction::Record,
+                                        &pressed,
+                                    ) {
+                                        hotkey_keys_down.push(plain_key.clone());
+                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleRecording);
+                                        return;
+                                    }
+
                                     if let Some(row_ix) = *keyboard_input_row.lock().unwrap() {
                                         if !is_modifier {
                                             let _ = mouse_tx.try_send(HotkeyEvent::KeyboardInput(
@@ -3185,39 +3517,24 @@ fn main() {
                                         return;
                                     }
 
-                                    // 开始/暂停 和 开始录制 不受“监听热键”开关影响。
-                                    if hotkey_pressed(
-                                        &listener_hotkeys,
-                                        HotkeyAction::ToggleRun,
-                                        &pressed,
-                                    ) {
-                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleExecution);
-                                        return;
-                                    }
-                                    if hotkey_pressed(
-                                        &listener_hotkeys,
-                                        HotkeyAction::Record,
-                                        &pressed,
-                                    ) {
-                                        let _ = mouse_tx.try_send(HotkeyEvent::ToggleRecording);
-                                        return;
-                                    }
-
-                                    // 录制中：除上面两个开关外，按下的键都记成一行键盘操作。
+                                    // 录制中：按下的键记成一行「按下 xxx」，包括 CTRL/SHIFT 这些
+                                    // 修饰键自己（它们的弹起会另记一行，这样按住的过程能还原）。
                                     if listener_record_flag.load(Ordering::Acquire) {
-                                        if is_modifier {
-                                            return;
-                                        }
                                         let (x, y, hwnd, title) = cursor_info();
+                                        let delay =
+                                            take_recorded_delay(&mut last_recorded_at, Instant::now());
                                         let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
                                             opt_cate: OptCate::键盘,
-                                            opt_type: keyboard_row_label(
-                                                &modifiers, caps_lock, &key,
+                                            opt_type: recorded_key_label(
+                                                KeyAction::Down,
+                                                caps_lock,
+                                                &key,
                                             ),
                                             x,
                                             y,
                                             hwnd,
                                             title,
+                                            delay,
                                         });
                                         return;
                                     }
@@ -3233,6 +3550,7 @@ fn main() {
                                         HotkeyAction::MouseEvent,
                                         &pressed,
                                     ) {
+                                        hotkey_keys_down.push(plain_key.clone());
                                         let (x, y, hwnd, title) = cursor_info();
                                         let _ = mouse_tx
                                             .try_send(HotkeyEvent::AddMouse(x, y, hwnd, title));
@@ -3241,6 +3559,7 @@ fn main() {
                                         HotkeyAction::KeyboardEvent,
                                         &pressed,
                                     ) {
+                                        hotkey_keys_down.push(plain_key.clone());
                                         let (x, y, hwnd, title) = cursor_info();
                                         let _ = mouse_tx.try_send(HotkeyEvent::AddKeyboard(
                                             x, y, hwnd, title,
@@ -3291,6 +3610,7 @@ fn main() {
                                                     title,
                                                     OptCate::鼠标,
                                                     None,
+                                                    0,
                                                 );
                                             }
                                             HotkeyEvent::AddKeyboard(x, y, hwnd, title)
@@ -3305,6 +3625,7 @@ fn main() {
                                                     title,
                                                     OptCate::键盘,
                                                     None,
+                                                    0,
                                                 );
                                             }
                                             HotkeyEvent::ToggleRecording
@@ -3322,6 +3643,7 @@ fn main() {
                                                 y,
                                                 hwnd,
                                                 title,
+                                                delay,
                                             } => {
                                                 view.add_hotkey_row(
                                                     window,
@@ -3332,6 +3654,7 @@ fn main() {
                                                     title,
                                                     opt_cate,
                                                     Some(opt_type),
+                                                    delay,
                                                 );
                                             }
                                             HotkeyEvent::KeyboardInput(row_ix, value) => {
@@ -3357,12 +3680,22 @@ fn main() {
                                             {
                                                 view.toggle_execution(cx);
                                             }
+                                            HotkeyEvent::ToggleOptTwo
+                                                if view.hotkey_modal.is_none() =>
+                                            {
+                                                view.toggle_opt_two(cx);
+                                            }
+                                            HotkeyEvent::OptTwoFinished => {
+                                                view.opt_two_running = false;
+                                                cx.notify();
+                                            }
                                             HotkeyEvent::RecordedDoubleClick {
                                                 opt_type,
                                                 x,
                                                 y,
                                                 hwnd,
                                                 title,
+                                                delay,
                                             } => {
                                                 // 上一行就是这次单击，就地改成双击；
                                                 // 万一没对上（比如中间插了别的操作）就补一行。
@@ -3388,6 +3721,7 @@ fn main() {
                                                         title,
                                                         OptCate::鼠标,
                                                         Some(opt_type),
+                                                        delay,
                                                     );
                                                     return;
                                                 }
@@ -3442,13 +3776,15 @@ mod double_click_tests {
     // 这里不用 `use super::*`：crate 根上 `use gpui::*` 会带进来 gpui 自己的
     // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
     use super::{
-        Duration, HWND, HotkeySettings, Instant, LPARAM, LEFT_DOUBLE_CLICK_LABEL,
-        MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
-        OptCate, SendMessageW, WPARAM, WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click,
-        double_click_gap, double_click_time_ms, fuzzy_point, hotkey_key_label, hotkey_keystroke,
-        is_double_click, is_left_double_click, keyboard_row_label, random_seed,
-        recorded_double_opt_type, recorded_mouse_opt_type, send_message_mouse,
-        sleep_until_stopped, split_keyboard_combo, waits_between_loops,
+        Duration, HWND, HotkeyAction, HotkeySettings, Instant, KeyAction, LPARAM,
+        LEFT_DOUBLE_CLICK_LABEL, MOUSE_MOVE_LABEL, MOUSE_OPT_TYPE_LABELS, ModifierState,
+        MouseOptType, MyData, MyTableDelegate, OperationGap, OptCate, SendMessageW, WPARAM,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click, double_click_gap,
+        double_click_time_ms, fuzzy_point, hotkey_key_label, hotkey_keystroke, is_double_click,
+        is_left_double_click, keeps_clicking, keyboard_row_label, plain_key_label, random_seed,
+        recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, send_message_mouse,
+        should_record_move, sleep_until_stopped, split_key_action, split_keyboard_combo,
+        take_recorded_delay, waits_between_loops,
     };
     use rdev::{Button as RdevButton, Key as RdevKey};
     use std::sync::Arc;
@@ -3591,15 +3927,16 @@ mod double_click_tests {
         }
     }
 
-    /// 下拉框里的七种操作方式：文案、还原、双击标记都要对得上，
-    /// 而且录制鼠标时写进表格的文案必须是这七种之一。
+    /// 下拉框里的八种操作方式：文案、还原、双击标记都要对得上，
+    /// 而且录制鼠标时写进表格的文案必须是这八种之一。
     #[test]
-    fn every_mouse_opt_type_round_trips_through_its_label() {        assert_eq!(MOUSE_OPT_TYPE_LABELS.len(), MouseOptType::ALL.len());
+    fn every_mouse_opt_type_round_trips_through_its_label() {
+        assert_eq!(MOUSE_OPT_TYPE_LABELS.len(), MouseOptType::ALL.len());
         assert_eq!(MOUSE_OPT_TYPE_LABELS[0].as_ref(), "左键单击");
         assert_eq!(MOUSE_OPT_TYPE_LABELS[1].as_ref(), LEFT_DOUBLE_CLICK_LABEL);
         assert_eq!(
             MOUSE_OPT_TYPE_LABELS.last().unwrap().as_ref(),
-            "右键双击"
+            MOUSE_MOVE_LABEL
         );
 
         for kind in MouseOptType::ALL {
@@ -3771,6 +4108,108 @@ mod double_click_tests {
         assert_eq!(split_keyboard_combo(""), (vec![], String::new()));
     }
 
+    /// 录制的键盘行：按下、弹起各写一行，手填的键名仍然是「按一下」。
+    #[test]
+    fn recorded_key_rows_keep_press_and_release_apart() {
+        // 文案：前缀 + 物理键名（修饰键自己有单独的行，所以键名里不带修饰键前缀）。
+        assert_eq!(
+            recorded_key_label(KeyAction::Down, false, &RdevKey::KeyA),
+            "按下 a"
+        );
+        assert_eq!(
+            recorded_key_label(KeyAction::Up, false, &RdevKey::KeyA),
+            "按下 a".replace("按下", "弹起")
+        );
+        assert_eq!(
+            recorded_key_label(KeyAction::Down, false, &RdevKey::ShiftLeft),
+            "按下 SHIFT"
+        );
+        assert_eq!(
+            recorded_key_label(KeyAction::Up, true, &RdevKey::KeyA),
+            "弹起 A"
+        );
+        assert_eq!(
+            recorded_key_label(KeyAction::Down, false, &RdevKey::F5),
+            "按下 F5"
+        );
+        // 手填的一整个按键没有前缀。
+        assert_eq!(
+            recorded_key_label(KeyAction::Press, false, &RdevKey::KeyA),
+            "a"
+        );
+
+        // 反过来能把动作拆回来。
+        assert_eq!(split_key_action("按下 a"), (KeyAction::Down, "a"));
+        assert_eq!(split_key_action("弹起 a"), (KeyAction::Up, "a"));
+        assert_eq!(split_key_action("按下  CTRL "), (KeyAction::Down, "CTRL"));
+        assert_eq!(split_key_action("a"), (KeyAction::Press, "a"));
+        assert_eq!(split_key_action("CTRL+c"), (KeyAction::Press, "CTRL+c"));
+        assert_eq!(split_key_action("弹起 F5"), (KeyAction::Up, "F5"));
+    }
+
+    /// 鼠标轨迹抽稀：间隔太短或没怎么动都不记。
+    #[test]
+    fn mouse_moves_are_thinned_out() {        let start = Instant::now();
+
+        // 第一条（录制开始后的第一次移动）总要记。
+        assert!(should_record_move(None, start, 10.0, 10.0));
+
+        let last = Some((start, 10.0, 10.0));
+        // 时间没到、距离也不够：不记。
+        assert!(!should_record_move(
+            last,
+            start + Duration::from_millis(5),
+            11.0,
+            11.0
+        ));
+        // 时间够久但基本没动：不记。
+        assert!(!should_record_move(
+            last,
+            start + Duration::from_millis(100),
+            11.0,
+            11.0
+        ));
+        // 动得够多、时间也够：记。
+        assert!(should_record_move(
+            last,
+            start + Duration::from_millis(30),
+            40.0,
+            10.0
+        ));
+        assert!(should_record_move(
+            last,
+            start + Duration::from_millis(30),
+            10.0,
+            40.0
+        ));
+
+        // 快捷键用掉的键名不带修饰键，方便弹起时对账。
+        assert_eq!(plain_key_label(&RdevKey::KeyA), "A");
+        assert_eq!(plain_key_label(&RdevKey::F10), "F10");
+    }
+
+    /// 录制的延迟：第一条是 0，之后每条都是距上一条真实过去的时间。
+    #[test]
+    fn recorded_rows_carry_the_gap_from_the_previous_one() {
+        let start = Instant::now();
+        let mut last = None;
+
+        assert_eq!(take_recorded_delay(&mut last, start), 0, "第一条没有上一步");
+        assert_eq!(
+            take_recorded_delay(&mut last, start + Duration::from_millis(120)),
+            120
+        );
+        // 紧接着的下一条只有几毫秒，就照实记几毫秒（而不是被抹成 0）。
+        assert_eq!(
+            take_recorded_delay(&mut last, start + Duration::from_millis(125)),
+            5
+        );
+        assert_eq!(
+            take_recorded_delay(&mut last, start + Duration::from_millis(1125)),
+            1000
+        );
+    }
+
     /// 修饰键自己不成一次操作，只用来拼组合键。
     #[test]
     fn modifier_state_tracks_keys_and_folds_into_labels() {
@@ -3938,6 +4377,43 @@ mod double_click_tests {
         // 循环次数 0 表示无限次，每轮之间都要等。
         assert!(waits_between_loops(0, 1));
         assert!(waits_between_loops(0, 99));
+    }
+
+    /// 五个快捷键（含操作二的开始/停止）默认值互不冲突。
+    #[test]
+    fn hotkey_defaults_cover_opt_two_without_clashes() {
+        assert_eq!(HotkeyAction::ALL.len(), 5);
+        assert_eq!(HotkeyAction::OptTwoRun.default_key(), "F9");
+
+        let settings = HotkeySettings::default();
+        let mut seen = std::collections::HashSet::new();
+        for action in HotkeyAction::ALL {
+            let key = settings.get(action).clone();
+            assert!(!key.trim().is_empty(), "{action:?} 应当有默认键");
+            assert!(seen.insert(key.clone()), "默认键 {key} 被两个操作同时占用");
+        }
+
+        // 改完绑定之后，冲突检测要认得出是操作二占了别人的键。
+        let mut settings = HotkeySettings::default();
+        settings.set(HotkeyAction::OptTwoRun, "F8");
+        assert_eq!(settings.get(HotkeyAction::OptTwoRun), "F8");
+        assert_eq!(
+            settings.conflict(HotkeyAction::OptTwoRun, "F8"),
+            Some(HotkeyAction::ToggleRun)
+        );
+    }
+
+    /// 操作二连点：次数 0 一直点，次数 N 点满就停，按了停止立刻不点。
+    #[test]
+    fn opt_two_clicks_until_stopped_or_counted_out() {        assert!(keeps_clicking(true, 0, 0));
+        assert!(keeps_clicking(true, 0, 9999));
+
+        assert!(keeps_clicking(true, 3, 0));
+        assert!(keeps_clicking(true, 3, 2));
+        assert!(!keeps_clicking(true, 3, 3), "次数用完就该停");
+
+        assert!(!keeps_clicking(false, 0, 0), "按了停止就不再点");
+        assert!(!keeps_clicking(false, 3, 1));
     }
 
     /// 循环间隔期间点暂停，等待要立刻结束，而不是把整段间隔睡完。
