@@ -47,6 +47,44 @@ const MK_LBUTTON: usize = 0x0001;
 const MK_RBUTTON: usize = 0x0002;
 const MK_MBUTTON: usize = 0x0010;
 
+/// 关于页里的下载地址。
+const DOWNLOAD_URL: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
+
+/// 关于页里的两张收款码：资源路径 + include_bytes! 进来的图。
+const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
+    ("payment/wechat.png", include_bytes!("assets/wechat.png")),
+    ("payment/alipay.png", include_bytes!("assets/zhi-pay.png")),
+];
+
+/// 程序自己的资源：两张收款码走内嵌字节，其余（组件的图标等）交给 gpui-component 的资源包。
+struct AppAssets {
+    components: gpui_component_assets::Assets,
+}
+
+impl AppAssets {
+    fn new() -> Self {
+        Self {
+            components: gpui_component_assets::Assets,
+        }
+    }
+}
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some((_, bytes)) = PAYMENT_IMAGES
+            .iter()
+            .find(|(resource, _)| *resource == path)
+        {
+            return Ok(Some(std::borrow::Cow::Borrowed(*bytes)));
+        }
+        self.components.load(path)
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        self.components.list(path)
+    }
+}
+
 fn set_selection_cursor(crosshair: bool) {
     unsafe {
         if crosshair {
@@ -1822,6 +1860,156 @@ impl IClick {
             .into_any_element()
     }
 
+    /// 关于页：整页水平居中，自上而下是标题、下载地址、收款码，然后是功能、快捷键和用法。
+    /// 内容比窗口高，所以整页可以滚动。
+    fn render_about(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // 每段文字都给一个确定的宽度、并显式打开换行：
+        // gpui 只在 white_space 是 Normal 且拿得到确定宽度时，才会按宽度换行来测量高度，
+        // 否则高度按「一行」算，换行后的第二行就会压到下一段上、滚动条也滚不到底。
+        let text_width = px(470.0);
+        let line = move |text: &str| {
+            div()
+                .w(text_width)
+                .flex_shrink_0()
+                .whitespace_normal()
+                .text_center()
+                .mb(px(6.0))
+                .child(text.to_string())
+        };
+        let heading = move |text: &str| {
+            div()
+                .w(text_width)
+                .flex_shrink_0()
+                .whitespace_normal()
+                .text_center()
+                .font_weight(FontWeight::SEMIBOLD)
+                .mt(px(16.0))
+                .mb(px(8.0))
+                .child(text.to_string())
+        };
+
+        let features = [
+            "操作一：把每一步操作列成表格，逐行编辑坐标、操作类型、操作方式、窗口、延迟和执行次数。",
+            "操作方式共 8 种：左键/右键/中键的单击与双击、滚轮上滑下滑、鼠标移动、键盘按下与弹起。",
+            "两种执行方式：后台把消息直接投给目标窗口（不抢鼠标、可后台点击），或前台用 SendInput 发真实点击。",
+            "录制（默认 F10）：鼠标移动、点击、滚轮、键盘按下与弹起，全部按真实间隔记进表格的「延迟」列。",
+            "模糊点击：每次点击都在坐标 ±模糊范围 内随机取点，避免老是点在同一个像素上。",
+            "循环控制：循环次数（0 表示无限次）、循环间隔（两轮之间等多久）、操作间隔（两步之间等多久）。",
+            "操作二：纯前台连点，按下快捷键后在鼠标当前位置连点，可以指定次数，也可以一直点到再按一次快捷键。",
+            "其它开关：窗口置顶、选择坐标时隐藏本窗口、监听热键、前台/后台操作。",
+        ];
+        let hotkeys = [
+            "F8：开始 / 暂停执行（按下立即停止）",
+            "F9：操作二 开始 / 停止连点",
+            "F10：开始 / 停止录制",
+            "F6：在鼠标位置插入一行鼠标操作",
+            "F7：在鼠标位置插入一行键盘操作",
+        ];
+        let steps = [
+            "1. 用「获取坐标方式一」的十字按钮，或者方式二的快捷键，把要用到的坐标加进表格。",
+            "2. 在表格里调整每一行的操作方式、延迟和执行次数。",
+            "3. 按需要设置模糊点击、循环次数、循环间隔、操作间隔。",
+            "4. 点「开始」或按 F8 执行；再按一次 F8 立即停止。",
+            "5. 嫌麻烦就直接按 F10 录一遍，录出来的表格还能继续手工微调。",
+        ];
+
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .w_full()
+            .p(px(8.0))
+            .child(
+                div()
+                    // 全界面统一 12px，标题只用加粗区分层级。
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .flex_shrink_0()
+                    .whitespace_normal()
+                    .child("iClick-gpui"),
+            )
+            .child(
+                div()
+                    .w(text_width)
+                    .text_center()
+                    .whitespace_normal()
+                    .flex_shrink_0()
+                    .text_color(cx.theme().muted_foreground)
+                    .mb(px(14.0))
+                    .child("一个用 Rust + GPUI 写的 Windows 连点 / 宏录制工具"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .mb(px(16.0))
+                    .child(div().mr(px(4.0)).child("下载地址："))
+                    .child(
+                        div()
+                            .id("download_link")
+                            .cursor(CursorStyle::PointingHand)
+                            .text_color(rgb(0x1f44fa))
+                            .text_decoration_1()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.open_url(DOWNLOAD_URL);
+                            }))
+                            .child(DOWNLOAD_URL),
+                    ),
+            )
+            .child(
+                div()
+                    .w(text_width)
+                    .flex_shrink_0()
+                    .whitespace_normal()
+                    .text_center()
+                    .mb(px(8.0))
+                    .child("如果您觉得本软件对您有帮助，可以把钱交给我保管"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .justify_center()
+                    .gap(px(12.0))
+                    .mb(px(6.0))
+                    .children(PAYMENT_IMAGES.iter().map(|(resource, _)| {
+                        img(*resource)
+                            .w(px(168.0))
+                            .rounded(px(6.0))
+                            .into_any_element()
+                    })),
+            );
+
+        column = column.child(heading("功能介绍"));
+        for feature in features {
+            column = column.child(line(feature));
+        }
+
+        column = column.child(heading("快捷键（在界面上点键位标签就能改）"));
+        for hotkey in hotkeys {
+            column = column.child(line(hotkey));
+        }
+
+        column = column.child(heading("使用步骤"));
+        for step in steps {
+            column = column.child(line(step));
+        }
+
+        column = column.child(heading("其它"));
+        column = column.child(line("技术栈：Rust + GPUI + gpui-component"));
+        column = column.child(line("作者：吾爱破解 xarzhi"));
+
+        // 滚动容器里只放这一列：滚动范围按这一列的真实高度算，底部的文字才滚得出来。
+        // 末尾多留一段空白：换行段落的高度累计起来会差几个像素，留白了最后一行才露得出来。
+        div()
+            .id("about_scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .child(column.child(div().h(px(64.0))))
+            .into_any_element()
+    }
+
     /// 操作二：纯前台连点。开始/停止快捷键和操作一那几个一样，
     /// 点小标签就能开弹窗改绑定。
     fn render_opt_two(&mut self, cx: &mut Context<Self>) -> Div {
@@ -3147,17 +3335,20 @@ impl Render for IClick {
                             .h(px(200.0))
                             .child(DataTable::new(&self.data_table).with_size(px(20.))),
                     )
+                    .into_any_element()
             } else if self.active_tab == 1 {
-                self.render_opt_two(cx)
+                self.render_opt_two(cx).into_any_element()
+            } else if self.active_tab == 2 {
+                self.render_about(cx)
             } else {
-                div()
+                div().into_any_element()
             })
             .children(hotkey_modal_layer)
     }
 }
 use regex::Regex;
 fn main() {
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let app = gpui_platform::application().with_assets(AppAssets::new());
 
     app.run(move |cx| {
         gpui_component::init(cx);
@@ -3263,6 +3454,7 @@ fn main() {
                             tabs: vec![
                                 "操作一".to_string(),
                                 "操作二".to_string(),
+                                "关于".to_string(),
                             ],
                             loop_count_input,
                             fuzzy_round_input,
