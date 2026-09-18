@@ -17,6 +17,9 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
 use gpui_component::{Icon, IconName};
 use rdev::{Button as RdevButton, Event, EventType, Key as RdevKey, listen};
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
@@ -24,9 +27,15 @@ use std::time::{Duration, Instant};
 use std::vec;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    GetActiveWindow, GetDoubleClickTime, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
     VkKeyScanW,
@@ -56,6 +65,389 @@ const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
     ("payment/alipay.png", include_bytes!("assets/zhi-pay.png")),
 ];
 
+/// 配置文件格式版本：以后结构变了可以按版本兼容。
+const CONFIG_VERSION: u32 = 1;
+
+/// 保存/读取的配置文件内容：程序里的所有配置 + 表格里的每一行。
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct ConfigFile {
+    /// 必填：没有这个字段就说明不是本程序的配置文件。
+    version: u32,
+    #[serde(default)]
+    saved_at: String,
+    #[serde(default)]
+    opt_one: OptOneConfig,
+    #[serde(default)]
+    opt_two: OptTwoConfig,
+    #[serde(default)]
+    hotkeys: HotkeyConfig,
+    #[serde(default)]
+    rows: Vec<RowConfig>,
+}
+
+/// 操作一页面上的配置。
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct OptOneConfig {
+    always_on_top: bool,
+    front_opt: bool,
+    fuzzy_click: bool,
+    fuzzy_round: String,
+    loop_count: String,
+    loop_gap: String,
+    opt_gap: String,
+    opt_cate: usize,
+    hide_when_choose: bool,
+    watch_hotkey: bool,
+    x: String,
+    y: String,
+    win_hwnd: String,
+    win_title: String,
+}
+
+impl Default for OptOneConfig {
+    fn default() -> Self {
+        Self {
+            always_on_top: false,
+            front_opt: false,
+            fuzzy_click: false,
+            fuzzy_round: "0".to_string(),
+            loop_count: "1".to_string(),
+            loop_gap: "0".to_string(),
+            opt_gap: "20".to_string(),
+            opt_cate: 0,
+            hide_when_choose: false,
+            watch_hotkey: true,
+            x: "0".to_string(),
+            y: "0".to_string(),
+            win_hwnd: String::new(),
+            win_title: String::new(),
+        }
+    }
+}
+
+/// 操作二页面上的配置。
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct OptTwoConfig {
+    click_gap: String,
+    click_count: String,
+}
+
+impl Default for OptTwoConfig {
+    fn default() -> Self {
+        Self {
+            click_gap: "20".to_string(),
+            click_count: "0".to_string(),
+        }
+    }
+}
+
+/// 五个全局快捷键的绑定。
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+struct HotkeyConfig {
+    record: String,
+    toggle_run: String,
+    mouse_event: String,
+    keyboard_event: String,
+    opt_two_run: String,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self::from(&HotkeySettings::default())
+    }
+}
+
+impl From<&HotkeySettings> for HotkeyConfig {
+    fn from(settings: &HotkeySettings) -> Self {
+        Self {
+            record: settings.record.clone(),
+            toggle_run: settings.toggle_run.clone(),
+            mouse_event: settings.mouse_event.clone(),
+            keyboard_event: settings.keyboard_event.clone(),
+            opt_two_run: settings.opt_two_run.clone(),
+        }
+    }
+}
+
+impl From<HotkeyConfig> for HotkeySettings {
+    fn from(config: HotkeyConfig) -> Self {
+        Self {
+            record: config.record,
+            toggle_run: config.toggle_run,
+            mouse_event: config.mouse_event,
+            keyboard_event: config.keyboard_event,
+            opt_two_run: config.opt_two_run,
+        }
+    }
+}
+
+/// 表格里的一行。
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+struct RowConfig {
+    x: usize,
+    y: usize,
+    #[serde(default)]
+    win_hwnd: String,
+    /// "鼠标" 或 "键盘"
+    opt_cate: String,
+    opt_type: String,
+    #[serde(default)]
+    win_title: Option<String>,
+    #[serde(default)]
+    delay: usize,
+    #[serde(default = "default_execute_time")]
+    execute_time: usize,
+}
+
+fn default_execute_time() -> usize {
+    1
+}
+
+impl ConfigFile {
+    /// 校验读进来的内容：版本对不对、每一行的数据说不说得通。
+    /// 只要有一处不对就报错，界面上原来的东西一点不动。
+    fn validate(&self) -> Result<(), String> {
+        if self.version == 0 || self.version > CONFIG_VERSION {
+            return Err(format!(
+                "不支持的配置文件版本 {}（本程序支持到 {}）",
+                self.version, CONFIG_VERSION
+            ));
+        }
+        for (index, row) in self.rows.iter().enumerate() {
+            let line = index + 1;
+            match row.opt_cate.as_str() {
+                "鼠标" => {
+                    if MouseOptType::from_label(&row.opt_type).is_none() {
+                        return Err(format!(
+                            "第 {line} 行的操作方式「{}」不是有效的鼠标操作",
+                            row.opt_type
+                        ));
+                    }
+                }
+                "键盘" => {
+                    if row.opt_type.trim().is_empty() {
+                        return Err(format!("第 {line} 行是键盘操作，但没写按键"));
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "第 {line} 行的操作类型「{other}」只能是「鼠标」或「键盘」"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 本机当前日期，用来拼配置文件名：iclick_config_2025_09_18.json。
+fn config_file_stem() -> String {
+    let time = unsafe { GetLocalTime() };
+    format!(
+        "iclick_config_{:04}_{:02}_{:02}",
+        time.wYear, time.wMonth, time.wDay
+    )
+}
+
+/// 保存时间，写进配置文件里给人看。
+fn local_datetime_text() -> String {
+    let time = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+    )
+}
+
+/// 程序所在目录：配置文件就放这儿，便携版在哪都能找到。
+fn app_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 保存配置的目标路径：程序目录下的 iclick_config_年月日.json。
+fn config_save_path() -> PathBuf {
+    app_dir().join(format!("{}.json", config_file_stem()))
+}
+
+/// 把相对路径按程序目录补全（拖到图标上的路径可能是相对的）。
+fn resolve_config_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        app_dir().join(path)
+    }
+}
+
+/// 打开/保存对话框要用到的宽字符串：跟着 OPENFILENAMEW 一起活到调用结束。
+struct DialogText {
+    filter: Vec<u16>,
+    title: Vec<u16>,
+    initial_dir: Vec<u16>,
+}
+
+impl DialogText {
+    fn new(title: &str) -> Self {
+        Self {
+            filter: "配置文件 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0\0"
+                .encode_utf16()
+                .collect(),
+            title: title.encode_utf16().chain(std::iter::once(0)).collect(),
+            initial_dir: app_dir()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect(),
+        }
+    }
+}
+
+/// 对话框回填的宽字符串（以 0 结尾）转成路径。
+fn wide_buffer_to_path(buffer: &[u16]) -> Option<PathBuf> {
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    if length == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
+/// 弹系统「打开文件」对话框挑配置文件；返回 None 表示用户点了取消。
+///
+/// 注意：这个函数会跑一个模态消息循环，必须放在后台线程里调用（见 `spawn_file_dialog`），
+/// 否则会和 gpui 自己的事件循环相互重入，直接把程序带崩。
+fn pick_config_file(owner: HWND) -> Result<Option<PathBuf>, String> {
+    let text = DialogText::new("选择要读取的配置文件");
+    let mut buffer = vec![0u16; 1024];
+    let mut options = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: windows::core::PCWSTR(text.filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(buffer.as_mut_ptr()),
+        nMaxFile: buffer.len() as u32,
+        lpstrInitialDir: windows::core::PCWSTR(text.initial_dir.as_ptr()),
+        lpstrTitle: windows::core::PCWSTR(text.title.as_ptr()),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+
+    if !unsafe { GetOpenFileNameW(&mut options) }.as_bool() {
+        return Ok(None);
+    }
+    Ok(wide_buffer_to_path(&buffer))
+}
+
+/// 弹系统「保存文件」对话框让用户挑保存位置，文件名默认是 iclick_config_年月日.json；
+/// 返回 None 表示用户点了取消。同样必须在后台线程里调用。
+fn pick_save_file(owner: HWND) -> Result<Option<PathBuf>, String> {
+    let text = DialogText::new("选择配置保存位置");
+    let default_path: Vec<u16> = config_save_path()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let default_extension: Vec<u16> = "json".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buffer = vec![0u16; 1024];
+    let copy_len = default_path.len().min(buffer.len());
+    buffer[..copy_len].copy_from_slice(&default_path[..copy_len]);
+
+    let mut options = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: windows::core::PCWSTR(text.filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(buffer.as_mut_ptr()),
+        nMaxFile: buffer.len() as u32,
+        lpstrInitialDir: windows::core::PCWSTR(text.initial_dir.as_ptr()),
+        lpstrTitle: windows::core::PCWSTR(text.title.as_ptr()),
+        lpstrDefExt: windows::core::PCWSTR(default_extension.as_ptr()),
+        // OFN_OVERWRITEPROMPT：选到已存在的文件时先问一句要不要覆盖。
+        Flags: OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+
+    if !unsafe { GetSaveFileNameW(&mut options) }.as_bool() {
+        return Ok(None);
+    }
+    Ok(wide_buffer_to_path(&buffer))
+}
+
+/// 「保存 / 读取」按钮按下的动作，交给后台线程去弹对话框。
+#[derive(Clone, Copy)]
+enum DialogKind {
+    Save,
+    Load,
+}
+
+/// 在后台线程里弹文件对话框，结果再发回界面线程套用。
+///
+/// 为什么不在界面线程直接弹：文件对话框自己会跑一个模态消息循环，界面线程被堵在里面时，
+/// gpui 的事件循环就和它重入了 —— 一旦重入触发 panic，整程序直接没了（用户看到的就是
+/// 「点一下保存程序就退出了」）。
+fn spawn_file_dialog(kind: DialogKind, sender: async_channel::Sender<HotkeyEvent>) {
+    // 模态对话框的属主：点按钮这会儿，本窗口就是当前活动窗口。
+    // HWND 里是裸指针，不能跨线程传，转成整数带过去再转回来。
+    let owner_value = unsafe { GetActiveWindow() }.0 as isize;
+    std::thread::spawn(move || {
+        let owner = HWND(owner_value as *mut std::ffi::c_void);
+        // 文件对话框走 COM，后台线程得自己初始化（按 STA 来，跟资源管理器一致）。
+        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+        let picked = match kind {
+            DialogKind::Save => pick_save_file(owner),
+            DialogKind::Load => pick_config_file(owner),
+        };
+        if initialized {
+            unsafe { CoUninitialize() };
+        }
+        let event = match kind {
+            DialogKind::Save => HotkeyEvent::SavePicked(picked),
+            DialogKind::Load => HotkeyEvent::LoadPicked(picked),
+        };
+        let _ = sender.try_send(event);
+    });
+}
+
+/// 解析并校验一份配置文本（读取文件和拖进来的文件都走这里）。
+fn parse_config(text: &str) -> Result<ConfigFile, String> {
+    let config: ConfigFile = serde_json::from_str(text)
+        .map_err(|error| format!("不是本程序的配置文件：{error}"))?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// 把配置写成 json 文件。
+fn write_config_file(config: &ConfigFile, path: &Path) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("生成配置内容失败：{error}"))?;
+    std::fs::write(path, json).map_err(|error| format!("写入 {} 失败：{error}", path.display()))
+}
+
+/// 把 panic 记到程序目录下的 iclick_panic.log。
+///
+/// 这是 GUI 程序（windows_subsystem = "windows"），没有控制台，panic 信息平时根本看不到，
+/// 程序一退就什么线索都没了；写个日志文件，出事能查。
+fn install_panic_logger() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|place| format!("{}:{}:{}", place.file(), place.line(), place.column()))
+            .unwrap_or_else(|| "未知位置".to_string());
+        let text = format!(
+            "[{}] panic at {location}\n{info}\n{}\n\n",
+            local_datetime_text(),
+            std::backtrace::Backtrace::force_capture()
+        );
+        let path = app_dir().join("iclick_panic.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(text.as_bytes());
+        }
+    }));
+}
+
 /// 程序自己的资源：两张收款码走内嵌字节，其余（组件的图标等）交给 gpui-component 的资源包。
 struct AppAssets {
     components: gpui_component_assets::Assets,
@@ -83,6 +475,17 @@ impl AssetSource for AppAssets {
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
         self.components.list(path)
     }
+}
+
+/// 这一次鼠标按下是不是落在输入框上。
+///
+/// 输入框外面那层容器会先收到 mouse down（事件从内层往外套），把这里置位；
+/// 页面根节点的 handler 随后消费这个标记，决定要不要让正在编辑的输入框失焦。
+static INPUT_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// 挂在输入框外层容器上的 mouse down：标记「这一下点在输入框里」。
+fn mark_input_press(_: &MouseDownEvent, _: &mut Window, _: &mut App) {
+    INPUT_PRESSED.store(true, Ordering::Release);
 }
 
 fn set_selection_cursor(crosshair: bool) {
@@ -151,6 +554,12 @@ enum HotkeyEvent {
     ToggleRecording,
     /// 修改快捷键的弹窗捕获到的新快捷键
     HotkeyCaptured(String),
+    /// 读取一个配置文件（界面上点「读取」，或者把文件拖到程序图标上启动）
+    LoadConfig(PathBuf),
+    /// 保存对话框选好的路径：Ok(None) 是用户取消
+    SavePicked(Result<Option<PathBuf>, String>),
+    /// 读取对话框选好的路径：Ok(None) 是用户取消
+    LoadPicked(Result<Option<PathBuf>, String>),
     /// 录制中捕捉到的一次操作。`delay` 是它距离上一个操作过了多少毫秒。
     RecordedInput {
         opt_cate: OptCate,
@@ -215,6 +624,10 @@ pub struct IClick {
     click_count_input: Entity<InputState>, // 点击次数
     _input_subscriptions: Vec<Subscription>,
     data_table: Entity<TableState<MyTableDelegate>>,
+    /// 读取/保存的结果，显示在表格上方；None 表示这次运行还没操作过。
+    config_status: Option<SharedString>,
+    /// 上面那条提示是不是错误（错误用红字）。
+    config_status_error: bool,
 }
 
 fn subscribe_select_all(input: &Entity<InputState>, cx: &mut App) -> Subscription {
@@ -1277,6 +1690,7 @@ impl TableDelegate for MyTableDelegate {
                     .flex()
                     .items_center()
                     .rounded_sm()
+                    .on_mouse_down(MouseButton::Left, mark_input_press)
                     .child(
                         Input::new(&self.opt_type_inputs[row_ix])
                             .size_full()
@@ -1288,11 +1702,17 @@ impl TableDelegate for MyTableDelegate {
                     )
                     .into_any_element(),
             },
-            "win_title" => row.win_title.clone().unwrap().into_any_element(),
+            // 标题可能是空的（比如手工写的配置里没写），不能 unwrap。
+            "win_title" => row
+                .win_title
+                .clone()
+                .unwrap_or_default()
+                .into_any_element(),
             "delay" => div()
                 .flex()
                 .items_center()
                 .rounded_sm()
+                .on_mouse_down(MouseButton::Left, mark_input_press)
                 .child(
                     Input::new(&self.delay_inputs[row_ix])
                         .size_full()
@@ -1307,6 +1727,7 @@ impl TableDelegate for MyTableDelegate {
                 .flex()
                 .items_center()
                 .rounded_sm()
+                .on_mouse_down(MouseButton::Left, mark_input_press)
                 .child(
                     Input::new(&self.execute_time_inputs[row_ix])
                         .size_full()
@@ -1325,6 +1746,23 @@ impl TableDelegate for MyTableDelegate {
 }
 
 impl MyTableDelegate {
+    /// 清空所有行（读取配置时用），跟着行一起建的输入框、下拉框和订阅也一起丢掉。
+    fn clear_rows(&mut self) {
+        self.data.clear();
+        self.delay_inputs.clear();
+        self.execute_time_inputs.clear();
+        self.opt_type_inputs.clear();
+        self.opt_cate_selects.clear();
+        self.opt_type_selects.clear();
+        self.delay_subscriptions.clear();
+        self.execute_time_subscriptions.clear();
+        self.opt_cate_subscriptions.clear();
+        self.opt_type_subscriptions.clear();
+        self.opt_type_select_subscriptions.clear();
+        *self.focused_keyboard_row.lock().unwrap() = None;
+        *self.expected_keyboard_value.lock().unwrap() = None;
+    }
+
     /// 录制时把刚记下的那一次点击并成双击：只有最后一行正好是同一次单击（同样的键、
     /// 位置在系统双击范围之内）才成立，免得把别的操作误改成双击。
     /// 返回 true 表示这一行已经就地升级成双击。
@@ -1697,6 +2135,149 @@ impl IClick {
         cx.notify();
     }
 
+    /// 记下读取/保存的结果（表格上方那行字），顺便刷新界面。
+    fn set_config_status(
+        &mut self,
+        message: impl Into<SharedString>,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.config_status = Some(message.into());
+        self.config_status_error = is_error;
+        cx.notify();
+    }
+
+    /// 把界面上所有配置和表格内容收集成一份配置。
+    fn collect_config(&self, cx: &App) -> ConfigFile {
+        let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        let rows = self
+            .data_table
+            .read(cx)
+            .delegate()
+            .data
+            .iter()
+            .map(|row| RowConfig {
+                x: row.x,
+                y: row.y,
+                win_hwnd: row.win_hwnd.clone(),
+                opt_cate: match row.opt_cate {
+                    OptCate::鼠标 => "鼠标".to_string(),
+                    OptCate::键盘 => "键盘".to_string(),
+                },
+                opt_type: row.opt_type.clone(),
+                win_title: row.win_title.clone(),
+                delay: row.delay,
+                execute_time: row.execute_time,
+            })
+            .collect();
+
+        ConfigFile {
+            version: CONFIG_VERSION,
+            saved_at: local_datetime_text(),
+            opt_one: OptOneConfig {
+                always_on_top: self.always_on_top,
+                front_opt: self.front_opt,
+                fuzzy_click: self.fuzzy_click,
+                fuzzy_round: text(&self.fuzzy_round_input),
+                loop_count: text(&self.loop_count_input),
+                loop_gap: text(&self.loop_gap_ipt),
+                opt_gap: text(&self.opt_gap_ipt),
+                opt_cate: self.opt_cate.unwrap_or(0),
+                hide_when_choose: self.hide_when_choose,
+                watch_hotkey: self.watch_hotkey,
+                x: text(&self.x_input),
+                y: text(&self.y_input),
+                win_hwnd: text(&self.win_hwnd_input),
+                win_title: text(&self.win_title_input),
+            },
+            opt_two: OptTwoConfig {
+                click_gap: text(&self.click_gap_input),
+                click_count: text(&self.click_count_input),
+            },
+            hotkeys: HotkeyConfig::from(&*lock_hotkeys(&self.hotkeys)),
+            rows,
+        }
+    }
+
+    /// 保存配置到用户选好的文件里。
+    fn save_config_to(&mut self, cx: &mut Context<Self>, path: &Path) -> Result<PathBuf, String> {
+        let config = self.collect_config(cx);
+        write_config_file(&config, path)?;
+        Ok(path.to_path_buf())
+    }
+
+    /// 读取配置文件并套用到界面上。
+    fn load_config(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        path: &Path,
+    ) -> Result<(), String> {
+        let path = resolve_config_path(path);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
+        let config = parse_config(&text)
+            .map_err(|error| format!("{}：{error}", path.display()))?;
+        self.apply_config(window, cx, config);
+        Ok(())
+    }
+
+    /// 把配置套用到界面：勾选、下拉、输入框、快捷键，以及整张表格。
+    fn apply_config(&mut self, window: &mut Window, cx: &mut Context<Self>, config: ConfigFile) {
+        let opt_one = config.opt_one;
+        self.always_on_top = opt_one.always_on_top;
+        self.front_opt = opt_one.front_opt;
+        self.fuzzy_click = opt_one.fuzzy_click;
+        self.opt_cate = Some(opt_one.opt_cate);
+        self.hide_when_choose = opt_one.hide_when_choose;
+        self.watch_hotkey = opt_one.watch_hotkey;
+        self.hotkey_flag
+            .store(self.watch_hotkey, Ordering::Release);
+
+        let inputs: [(&Entity<InputState>, String); 10] = [
+            (&self.fuzzy_round_input, opt_one.fuzzy_round),
+            (&self.loop_count_input, opt_one.loop_count),
+            (&self.loop_gap_ipt, opt_one.loop_gap),
+            (&self.opt_gap_ipt, opt_one.opt_gap),
+            (&self.x_input, opt_one.x),
+            (&self.y_input, opt_one.y),
+            (&self.win_hwnd_input, opt_one.win_hwnd),
+            (&self.win_title_input, opt_one.win_title),
+            (&self.click_gap_input, config.opt_two.click_gap),
+            (&self.click_count_input, config.opt_two.click_count),
+        ];
+        for (input, value) in inputs {
+            input.update(cx, |input, cx| input.set_value(&value, window, cx));
+        }
+
+        *lock_hotkeys(&self.hotkeys) = HotkeySettings::from(config.hotkeys);
+
+        let rows = config.rows;
+        self.data_table.update(cx, |table, cx| {
+            let delegate = table.delegate_mut();
+            delegate.clear_rows();
+            for row in rows {
+                let opt_cate = if row.opt_cate == "键盘" {
+                    OptCate::键盘
+                } else {
+                    OptCate::鼠标
+                };
+                let data = MyData {
+                    x: row.x,
+                    y: row.y,
+                    win_hwnd: row.win_hwnd,
+                    opt_cate,
+                    opt_type: row.opt_type,
+                    win_title: row.win_title,
+                    delay: row.delay,
+                    execute_time: row.execute_time.max(1),
+                };
+                delegate.add_row(window, cx, data);
+            }
+        });
+        cx.notify();
+    }
+
     /// 操作二的开始/停止：在当前鼠标位置连点，次数用完自己停，
     /// 点击次数填 0 就一直点，直到再按一次快捷键。
     fn toggle_opt_two(&mut self, cx: &mut Context<Self>) {
@@ -2061,6 +2642,7 @@ impl IClick {
                         div()
                             .ml(px(8.0))
                             .w(px(46.0))
+                            .on_mouse_down(MouseButton::Left, mark_input_press)
                             .child(Input::new(&self.click_gap_input).small().text_size(px(12.0))),
                     )
                     .child(div().ml(px(6.0)).child("ms")),
@@ -2074,6 +2656,7 @@ impl IClick {
                         div()
                             .ml(px(8.0))
                             .w(px(46.0))
+                            .on_mouse_down(MouseButton::Left, mark_input_press)
                             .child(Input::new(&self.click_count_input).small().text_size(px(12.0))),
                     )
                     .child(
@@ -2647,6 +3230,14 @@ impl Render for IClick {
             .relative()
             .size_full()
             .text_size(px(12.0))
+            // 点在输入框以外的地方就让正在编辑的输入框失焦（点在输入框里时不抢）。
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, window, cx| {
+                if INPUT_PRESSED.swap(false, Ordering::AcqRel) {
+                    return;
+                }
+                window.blur();
+                cx.notify();
+            }))
             .child(
                 TabBar::new("tabs")
                     .small()
@@ -3030,29 +3621,15 @@ impl Render for IClick {
                                                                     .mr(px(10.0))
                                                                     .cursor(
                                                                         CursorStyle::PointingHand,
-                                                                    ).on_click({
-																		let entity = cx.entity().clone();
-																		move |_, _window, cx| {
-																		entity.update(cx, |this, cx| {
-																			this.data_table.update(cx, |table_state, _cx| {
-																				let delegate = table_state.delegate();
-																				for (i, row) in delegate.data.iter().enumerate() {
-																					println!(
-																						"row {}: x={}, y={}, opt_cate={:?}, opt_type={}, delay={}, execute_time={}",
-																						i,
-																						row.x,
-																						row.y,
-																						row.opt_cate,
-																						row.opt_type,
-																						row.delay,
-																						row.execute_time,
-																					);
-																				}
-																				println!("total rows: {}", delegate.data.len());
-																			});
-																		});
-																	}
-																	})
+                                                                    )
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        // 对话框放到后台线程去弹，避免堵住 gpui 的事件循环。
+                                                                        spawn_file_dialog(
+                                                                            DialogKind::Load,
+                                                                            this.execution_event_tx.clone(),
+                                                                        );
+                                                                        cx.notify();
+                                                                    }))
                                                             )
                                                             .child(
                                                                 Button::new("save_btn")
@@ -3061,7 +3638,15 @@ impl Render for IClick {
                                                                     .text_size(px(12.0))
                                                                     .cursor(
                                                                         CursorStyle::PointingHand,
-                                                                    ),
+                                                                    )
+                                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                                        // 同样是后台线程弹保存对话框，用户选完再回传路径。
+                                                                        spawn_file_dialog(
+                                                                            DialogKind::Save,
+                                                                            this.execution_event_tx.clone(),
+                                                                        );
+                                                                        cx.notify();
+                                                                    })),
                                                             ),
                                                     ),
                                             )
@@ -3085,7 +3670,7 @@ impl Render for IClick {
 																				.build(window, cx)
 																	}),
                                                             )
-                                                            .child(div().w(px(80.0)).child(
+                                                            .child(div().w(px(80.0)).on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                                 Input::new(&self.loop_count_input).small().text_size(px(12.0)),
                                                             )),
                                                     )
@@ -3170,7 +3755,7 @@ impl Render for IClick {
                                                                     .child("模糊范围"),
                                                             )
                                                             .child(
-                                                                div().w(px(80.0)).child(
+                                                                div().w(px(80.0)).on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                                     Input::new(
                                                                         &self.fuzzy_round_input,
                                                                     ).small()
@@ -3194,7 +3779,7 @@ impl Render for IClick {
                                                                     .mr(px(10.0))
                                                                     .child("操作间隔："),
                                                             )
-                                                            .child(div().w(px(80.0)).child(
+                                                            .child(div().w(px(80.0)).on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                                 Input::new(&self.opt_gap_ipt).small().text_size(px(12.0)).suffix(div().child("ms"))
                                                             )),
                                                     )
@@ -3210,7 +3795,7 @@ impl Render for IClick {
                                                                     .child("循环间隔"),
                                                             )
                                                             .child(
-                                                                div().w(px(80.0)).child(
+                                                                div().w(px(80.0)).on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                                     Input::new(
                                                                         &self.loop_gap_ipt,
                                                                     ).small()
@@ -3274,7 +3859,7 @@ impl Render for IClick {
 									.id("x")
 
 							)
-							.child(div().child(
+							.child(div().on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                 Input::new(&self.x_input).small().text_size(px(12.0)).w(px(55.)),
 							)),
 						)
@@ -3291,7 +3876,7 @@ impl Render for IClick {
 									.id("y")
 
 							)
-							.child(div().child(
+							.child(div().on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                 Input::new(&self.y_input).small().text_size(px(12.0)).w(px(55.)),
 							)),
 						)
@@ -3309,7 +3894,7 @@ impl Render for IClick {
 									.id("win_hwnd")
 
 							)
-							.child(div().flex_1().child(
+							.child(div().flex_1().on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                 Input::new(&self.win_hwnd_input).small().text_size(px(12.0)),
 							)),
 						)
@@ -3324,17 +3909,35 @@ impl Render for IClick {
 									.child("窗口标题：")
 									.id("win_title")
 							)
-							.child(div().flex_1().child(
+							.child(div().flex_1().on_mouse_down(MouseButton::Left, mark_input_press).child(
                                                 Input::new(&self.win_title_input).small().text_size(px(12.0)),
 							))
 						)
 					)
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(200.0))
-                            .child(DataTable::new(&self.data_table).with_size(px(20.))),
-                    )
+                    .child({
+                        // 读取/保存的结果显示在表格上方，一眼能看到文件到底存哪了。
+                        let mut area = div().w_full().h(px(200.0)).flex().flex_col();
+                        if let Some(status) = self.config_status.clone() {
+                            area = area.child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .mb(px(4.0))
+                                    .flex_shrink_0()
+                                    .whitespace_normal()
+                                    .text_color(if self.config_status_error {
+                                        rgb(0xd03030)
+                                    } else {
+                                        rgb(0x1a7f37)
+                                    })
+                                    .child(status),
+                            );
+                        }
+                        area.child(
+                            div()
+                                .flex_1()
+                                .child(DataTable::new(&self.data_table).with_size(px(20.))),
+                        )
+                    })
                     .into_any_element()
             } else if self.active_tab == 1 {
                 self.render_opt_two(cx).into_any_element()
@@ -3348,6 +3951,7 @@ impl Render for IClick {
 }
 use regex::Regex;
 fn main() {
+    install_panic_logger();
     let app = gpui_platform::application().with_assets(AppAssets::new());
 
     app.run(move |cx| {
@@ -3448,6 +4052,9 @@ fn main() {
                         let hotkeys = Arc::new(std::sync::Mutex::new(HotkeySettings::default()));
                         let hotkey_capture_flag = Arc::new(AtomicBool::new(false));
                         let (mouse_tx, mouse_rx) = async_channel::unbounded::<HotkeyEvent>();
+                        // 把配置文件直接拖到程序图标上时，路径会作为第一个参数传进来。
+                        let startup_config = std::env::args_os().nth(1).map(PathBuf::from);
+                        let startup_config_tx = mouse_tx.clone();
 
                         let view = cx.new(|_| IClick {
                             active_tab: 0,
@@ -3462,6 +4069,8 @@ fn main() {
                             opt_gap_ipt,
                             _input_subscriptions: input_subscriptions,
                             data_table: state,
+                            config_status: None,
+                            config_status_error: false,
                             always_on_top: false,
                             front_opt: false,
                             fuzzy_click: false,
@@ -3828,6 +4437,55 @@ fn main() {
                                             HotkeyEvent::HotkeyCaptured(key) => {
                                                 view.apply_captured_hotkey(key, cx);
                                             }
+                                            HotkeyEvent::LoadConfig(path) => {
+                                                match view.load_config(window, cx, &path) {
+                                                    Ok(()) => view.set_config_status(
+                                                        format!("已读取配置：{}", path.display()),
+                                                        false,
+                                                        cx,
+                                                    ),
+                                                    Err(error) => {
+                                                        view.set_config_status(error, true, cx)
+                                                    }
+                                                }
+                                            }
+                                            HotkeyEvent::SavePicked(picked) => match picked {
+                                                Ok(Some(path)) => {
+                                                    match view.save_config_to(cx, &path) {
+                                                        Ok(path) => view.set_config_status(
+                                                            format!("已保存到 {}", path.display()),
+                                                            false,
+                                                            cx,
+                                                        ),
+                                                        Err(error) => {
+                                                            view.set_config_status(error, true, cx)
+                                                        }
+                                                    }
+                                                }
+                                                // 用户点了取消：什么都不做。
+                                                Ok(None) => {}
+                                                Err(error) => {
+                                                    view.set_config_status(error, true, cx)
+                                                }
+                                            },
+                                            HotkeyEvent::LoadPicked(picked) => match picked {
+                                                Ok(Some(path)) => {
+                                                    match view.load_config(window, cx, &path) {
+                                                        Ok(()) => view.set_config_status(
+                                                            format!("已读取配置：{}", path.display()),
+                                                            false,
+                                                            cx,
+                                                        ),
+                                                        Err(error) => {
+                                                            view.set_config_status(error, true, cx)
+                                                        }
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(error) => {
+                                                    view.set_config_status(error, true, cx)
+                                                }
+                                            },
                                             HotkeyEvent::RecordedInput {
                                                 opt_cate,
                                                 opt_type,
@@ -3949,6 +4607,12 @@ fn main() {
                                 }
                             })
                             .detach();
+
+                        // 事件循环起来之后再把启动参数里的配置送进去读。
+                        if let Some(path) = startup_config {
+                            let _ = startup_config_tx.try_send(HotkeyEvent::LoadConfig(path));
+                        }
+
                         cx.new(|cx| Root::new(view, window, cx))
                     },
                 )
@@ -3968,15 +4632,17 @@ mod double_click_tests {
     // 这里不用 `use super::*`：crate 根上 `use gpui::*` 会带进来 gpui 自己的
     // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
     use super::{
-        Duration, HWND, HotkeyAction, HotkeySettings, Instant, KeyAction, LPARAM,
-        LEFT_DOUBLE_CLICK_LABEL, MOUSE_MOVE_LABEL, MOUSE_OPT_TYPE_LABELS, ModifierState,
-        MouseOptType, MyData, MyTableDelegate, OperationGap, OptCate, SendMessageW, WPARAM,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click, double_click_gap,
-        double_click_time_ms, fuzzy_point, hotkey_key_label, hotkey_keystroke, is_double_click,
-        is_left_double_click, keeps_clicking, keyboard_row_label, plain_key_label, random_seed,
-        recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, send_message_mouse,
-        should_record_move, sleep_until_stopped, split_key_action, split_keyboard_combo,
-        take_recorded_delay, waits_between_loops,
+        CONFIG_VERSION, ConfigFile, Duration, HWND, HotkeyAction, HotkeyConfig, HotkeySettings,
+        Instant, KeyAction, LPARAM, LEFT_DOUBLE_CLICK_LABEL, MOUSE_MOVE_LABEL,
+        MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
+        OptCate, OptOneConfig, OptTwoConfig, RowConfig, SendMessageW, WPARAM, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, class_accepts_double_click, config_file_stem, config_save_path,
+        double_click_gap, double_click_time_ms, fuzzy_point, hotkey_key_label, hotkey_keystroke,
+        is_double_click, is_left_double_click, keeps_clicking, keyboard_row_label, parse_config,
+        plain_key_label, random_seed, recorded_double_opt_type, recorded_key_label,
+        recorded_mouse_opt_type, send_message_mouse, should_record_move, sleep_until_stopped,
+        split_key_action, split_keyboard_combo, take_recorded_delay, waits_between_loops,
+        write_config_file,
     };
     use rdev::{Button as RdevButton, Key as RdevKey};
     use std::sync::Arc;
@@ -4399,6 +5065,210 @@ mod double_click_tests {
         assert_eq!(
             take_recorded_delay(&mut last, start + Duration::from_millis(1125)),
             1000
+        );
+    }
+
+    /// 配置文件：存出来再读回去要一模一样。
+    #[test]
+    fn config_round_trips_through_json() {
+        let config = ConfigFile {
+            version: CONFIG_VERSION,
+            saved_at: "2025-09-18 22:30:00".to_string(),
+            opt_one: OptOneConfig {
+                always_on_top: true,
+                front_opt: true,
+                fuzzy_click: true,
+                fuzzy_round: "5".to_string(),
+                loop_count: "3".to_string(),
+                loop_gap: "200".to_string(),
+                opt_gap: "40".to_string(),
+                opt_cate: 1,
+                hide_when_choose: true,
+                watch_hotkey: false,
+                x: "100".to_string(),
+                y: "200".to_string(),
+                win_hwnd: "0x1234".to_string(),
+                win_title: "记事本".to_string(),
+            },
+            opt_two: OptTwoConfig {
+                click_gap: "30".to_string(),
+                click_count: "9".to_string(),
+            },
+            hotkeys: HotkeyConfig {
+                record: "F11".to_string(),
+                toggle_run: "CTRL+F8".to_string(),
+                mouse_event: "F6".to_string(),
+                keyboard_event: "F7".to_string(),
+                opt_two_run: "F9".to_string(),
+            },
+            rows: vec![
+                RowConfig {
+                    x: 100,
+                    y: 200,
+                    win_hwnd: "0x1234".to_string(),
+                    opt_cate: "鼠标".to_string(),
+                    opt_type: "左键双击".to_string(),
+                    win_title: Some("记事本".to_string()),
+                    delay: 120,
+                    execute_time: 2,
+                },
+                RowConfig {
+                    x: 0,
+                    y: 0,
+                    win_hwnd: "0x1234".to_string(),
+                    opt_cate: "键盘".to_string(),
+                    opt_type: "按下 CTRL".to_string(),
+                    win_title: None,
+                    delay: 0,
+                    execute_time: 1,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string_pretty(&config).expect("能序列化");
+        let restored: ConfigFile = serde_json::from_str(&json).expect("能反序列化");
+        assert_eq!(restored, config);
+        restored.validate().expect("自己存的配置必须能通过校验");
+        assert_eq!(
+            HotkeySettings::from(restored.hotkeys.clone()).toggle_run,
+            "CTRL+F8"
+        );
+    }
+
+    /// 校验：版本不对、操作类型/操作方式不对都要拦下来；缺省字段按默认值补。
+    #[test]
+    fn config_validation_rejects_bad_files() {
+        // 不是本程序的 json：连 version 都没有。
+        assert!(serde_json::from_str::<ConfigFile>(r#"{"foo": 1}"#).is_err());
+        // 版本太新 / 为 0。
+        let too_new: ConfigFile =
+            serde_json::from_str(r#"{"version": 99}"#).expect("字段齐全就能解析");
+        assert!(too_new.validate().is_err());
+        let zero: ConfigFile = serde_json::from_str(r#"{"version": 0}"#).expect("能解析");
+        assert!(zero.validate().is_err());
+
+        // 只有版本号时其余字段用默认值补上，而且能通过校验（空表格）。
+        let minimal: ConfigFile = serde_json::from_str(r#"{"version": 1}"#).expect("能解析");
+        assert_eq!(minimal.opt_one.loop_count, "1");
+        assert_eq!(minimal.opt_one.opt_gap, "20");
+        assert_eq!(minimal.opt_two.click_gap, "20");
+        assert_eq!(minimal.hotkeys.toggle_run, "F8");
+        assert!(minimal.rows.is_empty());
+        minimal.validate().expect("最小配置应当合法");
+
+        // 行数据不合法：操作类型乱写、鼠标操作方式不认识、键盘行没写按键。
+        let bad_cate: ConfigFile = serde_json::from_str(
+            r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"触屏","opt_type":"点一下"}]}"#,
+        )
+        .expect("能解析");
+        assert!(bad_cate.validate().is_err());
+
+        let bad_type: ConfigFile = serde_json::from_str(
+            r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"鼠标","opt_type":"乱点"}]}"#,
+        )
+        .expect("能解析");
+        assert!(bad_type.validate().is_err());
+
+        let bad_key: ConfigFile = serde_json::from_str(
+            r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"键盘","opt_type":"  "}]}"#,
+        )
+        .expect("能解析");
+        assert!(bad_key.validate().is_err());
+
+        // execute_time 没写时按 1 补。
+        let no_time: ConfigFile = serde_json::from_str(
+            r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"鼠标","opt_type":"左键单击"}]}"#,
+        )
+        .expect("能解析");
+        assert_eq!(no_time.rows[0].execute_time, 1);
+        no_time.validate().expect("合法行");
+    }
+
+    /// 配置文件名要符合 iclick_config_年_月_日.json。
+    #[test]
+    fn config_file_name_uses_today() {
+        let stem = config_file_stem();
+        // iclick_config_YYYY_MM_DD 拆开是 5 段。
+        let parts: Vec<&str> = stem.split('_').collect();
+        assert_eq!(parts.len(), 5, "形如 iclick_config_2025_09_18：{stem}");
+        assert_eq!(parts[0], "iclick");
+        assert_eq!(parts[1], "config");
+        assert_eq!(parts[2].len(), 4, "年份是四位：{stem}");
+        assert_eq!(parts[3].len(), 2, "月份是两位：{stem}");
+        assert_eq!(parts[4].len(), 2, "日期是两位：{stem}");
+        for part in &parts[2..] {
+            assert!(part.chars().all(|ch| ch.is_ascii_digit()), "{stem}");
+        }
+        assert!(
+            config_save_path()
+                .to_string_lossy()
+                .ends_with(&format!("{stem}.json")),
+            "保存路径要用这个名字"
+        );
+    }
+
+    /// 配置文件写出来再读回去要一模一样（真的过一遍磁盘）。
+    #[test]
+    fn config_file_survives_a_disk_round_trip() {
+        let config = ConfigFile {
+            version: CONFIG_VERSION,
+            saved_at: "2025-09-18 23:05:00".to_string(),
+            opt_one: OptOneConfig {
+                front_opt: true,
+                fuzzy_click: true,
+                fuzzy_round: "9".to_string(),
+                loop_count: "2".to_string(),
+                opt_gap: "45".to_string(),
+                watch_hotkey: false,
+                x: "77".to_string(),
+                y: "88".to_string(),
+                win_hwnd: "0x55".to_string(),
+                ..OptOneConfig::default()
+            },
+            opt_two: OptTwoConfig {
+                click_gap: "12".to_string(),
+                click_count: "6".to_string(),
+            },
+            hotkeys: HotkeyConfig::default(),
+            rows: vec![RowConfig {
+                x: 5,
+                y: 6,
+                win_hwnd: "0x55".to_string(),
+                opt_cate: "键盘".to_string(),
+                opt_type: "按下 A".to_string(),
+                win_title: None,
+                delay: 250,
+                execute_time: 3,
+            }],
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "iclick_config_test_{}.json",
+            std::process::id()
+        ));
+        write_config_file(&config, &path).expect("能写文件");
+        let text = std::fs::read_to_string(&path).expect("能读回文件");
+        let _ = std::fs::remove_file(&path);
+
+        let restored = parse_config(&text).expect("能解析校验");
+        assert_eq!(restored, config);
+        assert_eq!(restored.rows[0].delay, 250);
+        assert_eq!(restored.rows[0].execute_time, 3);
+    }
+
+    /// 别人的 json / 内容不合法的 json 都要被挡下来。
+    #[test]
+    fn parse_config_rejects_foreign_and_broken_files() {
+        assert!(parse_config("{\"hello\": \"world\"}").is_err(), "缺 version");
+        assert!(parse_config("not json at all").is_err(), "压根不是 json");
+        assert!(
+            parse_config(r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"鼠标","opt_type":"乱写"}]}"#)
+                .is_err(),
+            "操作方式不认识"
+        );
+        assert!(
+            parse_config(r#"{"version":1,"rows":[]}"#).is_ok(),
+            "空表格的配置是合法的"
         );
     }
 
