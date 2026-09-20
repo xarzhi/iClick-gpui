@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use std::vec;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
@@ -35,19 +35,19 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetActiveWindow, GetDoubleClickTime, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
     VkKeyScanW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, GA_ROOT, GCL_STYLE, GetAncestor, GetClassLongPtrW, GetCursorPos,
     GetForegroundWindow, GetSystemMetrics, GetWindowTextW, IDC_CROSS, LoadCursorW, OCR_NORMAL,
-    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW, SendMessageW,
-    SetCursorPos, SetForegroundWindow, SetSystemCursor, ShowWindow, SystemParametersInfoW,
-    WHEEL_DELTA, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WindowFromPoint,
+    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SPI_SETCURSORS, SPIF_SENDCHANGE, SW_HIDE, SW_SHOW,
+    SendMessageW, SetCursorPos, SetForegroundWindow, SetSystemCursor, ShowWindow,
+    SystemParametersInfoW, WHEEL_DELTA, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WindowFromPoint,
 };
 
 /// 鼠标消息 wParam 里的“哪个键正按下”标志（winuser.h 的 MK_*），
@@ -58,6 +58,9 @@ const MK_MBUTTON: usize = 0x0010;
 
 /// 关于页里的下载地址。
 const DOWNLOAD_URL: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
+
+/// 关于页里的作者主页。
+const AUTHOR_URL: &str = "https://www.52pojie.cn/home.php?mod=space&uid=2283786";
 
 /// 关于页里的两张收款码：资源路径 + include_bytes! 进来的图。
 const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
@@ -108,6 +111,10 @@ struct OptOneConfig {
     always_on_top: bool,
     front_opt: bool,
     fuzzy_click: bool,
+    /// 随机延迟：勾上以后新添的行，延迟在下面的范围里随机取
+    random_delay: bool,
+    random_delay_min: String,
+    random_delay_max: String,
     fuzzy_round: String,
     loop_count: String,
     loop_gap: String,
@@ -127,6 +134,9 @@ impl Default for OptOneConfig {
             always_on_top: false,
             front_opt: false,
             fuzzy_click: false,
+            random_delay: false,
+            random_delay_min: "50".to_string(),
+            random_delay_max: "200".to_string(),
             fuzzy_round: "0".to_string(),
             loop_count: "1".to_string(),
             loop_gap: "0".to_string(),
@@ -284,6 +294,15 @@ fn validate_rows(rows: &[RowConfig], prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 在 [min, max] 里取一个随机延迟（含两端）；范围填反了就按 min 算。
+fn random_delay_between(seed: &mut u64, min: usize, max: usize) -> usize {
+    if max <= min {
+        return min;
+    }
+    let span = (max - min + 1) as u64;
+    min + (next_random(seed) % span) as usize
+}
+
 /// 本机当前日期，用来拼配置文件名：iclick_config_2025_09_18.json。
 fn config_file_stem() -> String {
     let time = unsafe { GetLocalTime() };
@@ -350,7 +369,10 @@ impl DialogText {
 
 /// 对话框回填的宽字符串（以 0 结尾）转成路径。
 fn wide_buffer_to_path(buffer: &[u16]) -> Option<PathBuf> {
-    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
     if length == 0 {
         return None;
     }
@@ -453,8 +475,8 @@ fn spawn_file_dialog(kind: DialogKind, sender: async_channel::Sender<HotkeyEvent
 
 /// 解析并校验一份配置文本（读取文件和拖进来的文件都走这里）。
 fn parse_config(text: &str) -> Result<ConfigFile, String> {
-    let config: ConfigFile = serde_json::from_str(text)
-        .map_err(|error| format!("不是本程序的配置文件：{error}"))?;
+    let config: ConfigFile =
+        serde_json::from_str(text).map_err(|error| format!("不是本程序的配置文件：{error}"))?;
     config.validate()?;
     Ok(config)
 }
@@ -727,17 +749,21 @@ pub struct IClick {
     win_title_input: Entity<InputState>,
     loop_count_input: Entity<InputState>,  // 循环次数
     fuzzy_round_input: Entity<InputState>, // 模糊范围
-    loop_gap_ipt: Entity<InputState>,      // 循环间隔
-    opt_gap_ipt: Entity<InputState>,       // 操作间隔
+    /// 随机延迟：勾上以后新加进来的行，延迟在下面这个范围里随机取。
+    random_delay: bool,
+    random_delay_min_input: Entity<InputState>, // 随机延迟范围下限
+    random_delay_max_input: Entity<InputState>, // 随机延迟范围上限
+    /// 取随机延迟用的状态（xorshift）。
+    delay_random_state: u64,
+    loop_gap_ipt: Entity<InputState>, // 循环间隔
+    opt_gap_ipt: Entity<InputState>,  // 操作间隔
     // 操作二（纯前台连点）的输入框；开始/停止快捷键用的是全局快捷键，没有输入框。
     click_gap_input: Entity<InputState>,   // 点击间隔
     click_count_input: Entity<InputState>, // 点击次数
     _input_subscriptions: Vec<Subscription>,
     data_table: Entity<TableState<MyTableDelegate>>,
-    /// 读取/保存的结果，显示在表格上方；None 表示这次运行还没操作过。
-    config_status: Option<SharedString>,
-    /// 上面那条提示是不是错误（错误用红字）。
-    config_status_error: bool,
+    /// 读取/保存出错时的那行红字（显示在读取/保存按钮下面）；None 表示没出错。
+    config_error: Option<SharedString>,
 }
 
 fn subscribe_select_all(input: &Entity<InputState>, cx: &mut App) -> Subscription {
@@ -823,7 +849,9 @@ impl MouseOptType {
     /// 从行数据里保存的文案还原操作方式；空值或不认识的文案返回 None。
     fn from_label(label: &str) -> Option<Self> {
         let label = label.trim();
-        Self::ALL.into_iter().find(|kind| kind.label().as_ref() == label)
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.label().as_ref() == label)
     }
 
     /// 双击需要在第一次点按之后再补一组按下/抬起。
@@ -1109,11 +1137,7 @@ fn split_key_action(label: &str) -> (KeyAction, &str) {
 /// 录制键盘事件时写进表格的文案：每个按下、弹起都各记一行，
 /// 修饰键（CTRL/SHIFT/ALT）自己也会被记成普通行，所以这里只写物理键名。
 fn recorded_key_label(action: KeyAction, caps_lock: bool, key: &RdevKey) -> String {
-    format!(
-        "{}{}",
-        action.prefix(),
-        keyboard_key_label(key, caps_lock)
-    )
+    format!("{}{}", action.prefix(), keyboard_key_label(key, caps_lock))
 }
 
 /// 把表格里的键盘操作拆成（修饰键虚拟键码, 主键名）。没有组合时修饰键是空的。
@@ -1149,8 +1173,7 @@ fn hotkey_keystroke(label: &str) -> Keystroke {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    Keystroke::parse(&source)
-        .unwrap_or_else(|_| Keystroke::parse("f1").expect("f1 一定是合法按键"))
+    Keystroke::parse(&source).unwrap_or_else(|_| Keystroke::parse("f1").expect("f1 一定是合法按键"))
 }
 
 /// 录制时把鼠标键映射成表格里的操作方式。
@@ -1380,6 +1403,16 @@ const MAX_SCHEMES: usize = 5;
 
 /// 方案名按顺序取：方案一 … 方案五。
 const SCHEME_NAMES: [&str; MAX_SCHEMES] = ["方案一", "方案二", "方案三", "方案四", "方案五"];
+
+/// 新方案用哪个名字：取第一个还没被占用的（删掉中间某个方案后，
+/// 再加回来应该补上那个空位，而不是撞名）。
+fn first_free_scheme_name(used: &[&str]) -> &'static str {
+    SCHEME_NAMES
+        .iter()
+        .find(|name| !used.contains(name))
+        .copied()
+        .unwrap_or(SCHEME_NAMES[0])
+}
 
 /// 一个方案：名字 + 它自己的一份操作列表（每个方案就是一个独立的表格）。
 #[derive(Clone, Debug)]
@@ -1771,13 +1804,14 @@ impl TableDelegate for MyTableDelegate {
         let table = cx.entity().clone();
         menu.item(
             // 弹窗菜单的条目字号是组件内部写死的，用自己的元素才能跟着全局的 12px。
-            PopupMenuItem::element(|_, _| div().text_size(px(12.0)).child("删除本行"))
-                .on_click(move |_, _, cx| {
+            PopupMenuItem::element(|_, _| div().text_size(px(12.0)).child("删除本行")).on_click(
+                move |_, _, cx| {
                     table.update(cx, |table, cx| {
                         table.delegate_mut().remove_row(row_ix);
                         cx.notify();
                     });
-                }),
+                },
+            ),
         )
     }
 
@@ -1835,11 +1869,7 @@ impl TableDelegate for MyTableDelegate {
                     .into_any_element(),
             },
             // 标题可能是空的（比如手工写的配置里没写），不能 unwrap。
-            "win_title" => row
-                .win_title
-                .clone()
-                .unwrap_or_default()
-                .into_any_element(),
+            "win_title" => row.win_title.clone().unwrap_or_default().into_any_element(),
             "delay" => div()
                 .flex()
                 .items_center()
@@ -1873,7 +1903,12 @@ impl TableDelegate for MyTableDelegate {
             _ => "".to_string().into_any_element(),
         };
 
-        div().p(px(0.0)).flex().text_size(px(12.0)).items_center().child(text)
+        div()
+            .p(px(0.0))
+            .flex()
+            .text_size(px(12.0))
+            .items_center()
+            .child(text)
     }
 }
 
@@ -1940,7 +1975,12 @@ impl MyTableDelegate {
             return false;
         }
         self.stash_active_scheme();
-        let name = SCHEME_NAMES[self.schemes.len().min(MAX_SCHEMES - 1)].to_string();
+        let used: Vec<&str> = self
+            .schemes
+            .iter()
+            .map(|scheme| scheme.name.as_str())
+            .collect();
+        let name = first_free_scheme_name(&used).to_string();
         self.schemes.push(Scheme {
             name,
             rows: Vec::new(),
@@ -1952,8 +1992,42 @@ impl MyTableDelegate {
         true
     }
 
+    /// 删掉第 index 个方案（方案一不给删）；删的是当前方案就切到前一个。
+    /// 返回是否真的删了。
+    fn remove_scheme(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> bool {
+        if index == 0 || index >= self.schemes.len() {
+            return false;
+        }
+        // 先把当前方案的内容存回去，免得待会儿搬数据时丢掉正在编辑的行。
+        self.stash_active_scheme();
+        self.schemes.remove(index);
+        let target = if self.active_scheme == index {
+            index - 1
+        } else if self.active_scheme > index {
+            self.active_scheme - 1
+        } else {
+            self.active_scheme
+        };
+        self.active_scheme = target;
+        let rows = self.schemes[target].rows.clone();
+        self.clear_rows();
+        for row in rows {
+            self.add_row(window, cx, row);
+        }
+        true
+    }
+
     /// 清空当前方案的所有行；返回清掉的行数。
-    fn clear_active_scheme(&mut self, _window: &mut Window, _cx: &mut Context<TableState<Self>>) -> usize {
+    fn clear_active_scheme(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> usize {
         let removed = self.data.len();
         self.clear_rows();
         if let Some(scheme) = self.schemes.get_mut(self.active_scheme) {
@@ -2185,7 +2259,7 @@ impl IClick {
         title: String,
         opt_cate: OptCate,
         opt_type: Option<String>,
-        delay: usize,
+        recorded_delay: usize,
     ) {
         self.x_input.update(cx, |input, cx| {
             input.set_value(&(x.round() as usize).to_string(), window, cx);
@@ -2196,6 +2270,14 @@ impl IClick {
         self.win_title_input.update(cx, |input, cx| {
             input.set_value(&title, window, cx);
         });
+
+        // 勾了「随机延迟」就不用录制到的那个间隔，改成在设定范围里随手取一个。
+        let delay = if self.random_delay {
+            let (min, max) = self.random_delay_range(cx);
+            random_delay_between(&mut self.delay_random_state, min, max)
+        } else {
+            recorded_delay
+        };
 
         // 录制出来的行带着当时用的操作方式，热键插的行用默认值。
         let opt_type = opt_type.unwrap_or_else(|| default_opt_type(&opt_cate));
@@ -2235,6 +2317,14 @@ impl IClick {
         };
         let opt_type = default_opt_type(&opt_cate);
 
+        // 和快捷键插行一样：勾了「随机延迟」就在范围里随机取一个。
+        let delay = if self.random_delay {
+            let (min, max) = self.random_delay_range(cx);
+            random_delay_between(&mut self.delay_random_state, min, max)
+        } else {
+            0
+        };
+
         let data = MyData {
             x,
             y,
@@ -2242,7 +2332,7 @@ impl IClick {
             opt_cate,
             opt_type,
             win_title: Some(win_title),
-            delay: 0,
+            delay,
             execute_time: 1,
         };
 
@@ -2334,16 +2424,19 @@ impl IClick {
         cx.notify();
     }
 
-    /// 记下读取/保存的结果（表格上方那行字），顺便刷新界面。
-    fn set_config_status(
-        &mut self,
-        message: impl Into<SharedString>,
-        is_error: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.config_status = Some(message.into());
-        self.config_status_error = is_error;
+    /// 记下出错信息（显示在读取/保存按钮下面那行红字），顺便刷新界面。
+    /// 成功的提示不往界面上写，免得占地方。
+    fn set_config_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.config_error = Some(message.into());
         cx.notify();
+    }
+
+    /// 清掉之前那条出错信息。
+    fn clear_config_error(&mut self, cx: &mut Context<Self>) {
+        if self.config_error.is_some() {
+            self.config_error = None;
+            cx.notify();
+        }
     }
 
     /// 把界面上所有配置和每个方案的操作列表收集成一份配置。
@@ -2379,6 +2472,9 @@ impl IClick {
                 always_on_top: self.always_on_top,
                 front_opt: self.front_opt,
                 fuzzy_click: self.fuzzy_click,
+                random_delay: self.random_delay,
+                random_delay_min: text(&self.random_delay_min_input),
+                random_delay_max: text(&self.random_delay_max_input),
                 fuzzy_round: text(&self.fuzzy_round_input),
                 loop_count: text(&self.loop_count_input),
                 loop_gap: text(&self.loop_gap_ipt),
@@ -2419,8 +2515,7 @@ impl IClick {
         let path = resolve_config_path(path);
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
-        let config = parse_config(&text)
-            .map_err(|error| format!("{}：{error}", path.display()))?;
+        let config = parse_config(&text).map_err(|error| format!("{}：{error}", path.display()))?;
         self.apply_config(window, cx, config);
         Ok(())
     }
@@ -2434,14 +2529,16 @@ impl IClick {
         self.always_on_top = opt_one.always_on_top;
         self.front_opt = opt_one.front_opt;
         self.fuzzy_click = opt_one.fuzzy_click;
+        self.random_delay = opt_one.random_delay;
         self.opt_cate = Some(opt_one.opt_cate);
         self.hide_when_choose = opt_one.hide_when_choose;
         self.watch_hotkey = opt_one.watch_hotkey;
-        self.hotkey_flag
-            .store(self.watch_hotkey, Ordering::Release);
+        self.hotkey_flag.store(self.watch_hotkey, Ordering::Release);
 
-        let inputs: [(&Entity<InputState>, String); 10] = [
+        let inputs: [(&Entity<InputState>, String); 12] = [
             (&self.fuzzy_round_input, opt_one.fuzzy_round),
+            (&self.random_delay_min_input, opt_one.random_delay_min),
+            (&self.random_delay_max_input, opt_one.random_delay_max),
             (&self.loop_count_input, opt_one.loop_count),
             (&self.loop_gap_ipt, opt_one.loop_gap),
             (&self.opt_gap_ipt, opt_one.opt_gap),
@@ -2474,38 +2571,51 @@ impl IClick {
 
     /// 上面那排方案 tab 被点了：切到对应方案。
     fn switch_scheme(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.data_table
-            .update(cx, |table, cx| table.delegate_mut().switch_scheme(index, window, cx));
+        self.data_table.update(cx, |table, cx| {
+            table.delegate_mut().switch_scheme(index, window, cx)
+        });
         cx.notify();
     }
 
     /// 「添加方案」：加一个空方案并切过去，最多 MAX_SCHEMES 个。
+    /// 到上限时按钮本身会变灰（见渲染处），所以这里不用再提示什么。
     fn add_scheme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let added = self
-            .data_table
+        self.data_table
             .update(cx, |table, cx| table.delegate_mut().add_scheme(window, cx));
-        if added {
-            let count = self.data_table.read(cx).delegate().schemes.len();
-            self.set_config_status(format!("已添加方案（共 {count} 个，最多 {MAX_SCHEMES} 个）"), false, cx);
-        } else {
-            self.set_config_status(format!("最多只能有 {MAX_SCHEMES} 个方案"), true, cx);
-        }
+        cx.notify();
+    }
+
+    /// 「随机延迟」用的范围（用户填的两个输入框，填反了会自动调正）。
+    fn random_delay_range(&self, cx: &App) -> (usize, usize) {
+        let min = self
+            .random_delay_min_input
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(0);
+        let max = self
+            .random_delay_max_input
+            .read(cx)
+            .value()
+            .parse::<usize>()
+            .unwrap_or(0);
+        if max < min { (max, min) } else { (min, max) }
+    }
+
+    /// 删掉第 index 个方案；方案一不给删。
+    fn remove_scheme(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.data_table.update(cx, |table, cx| {
+            table.delegate_mut().remove_scheme(index, window, cx)
+        });
+        cx.notify();
     }
 
     /// 「清空列表」：把当前方案的操作全部清掉。
     fn clear_scheme_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let removed = self
-            .data_table
-            .update(cx, |table, cx| table.delegate_mut().clear_active_scheme(window, cx));
-        let name = {
-            let delegate = self.data_table.read(cx).delegate();
-            delegate
-                .schemes
-                .get(delegate.active_scheme)
-                .map(|scheme| scheme.name.clone())
-                .unwrap_or_default()
-        };
-        self.set_config_status(format!("已清空「{name}」的 {removed} 行"), false, cx);
+        self.data_table.update(cx, |table, cx| {
+            table.delegate_mut().clear_active_scheme(window, cx)
+        });
+        cx.notify();
     }
 
     /// 操作二的开始/停止：在当前鼠标位置连点，次数用完自己停，
@@ -2809,13 +2919,34 @@ impl IClick {
 
         column = column.child(heading("其它"));
         column = column.child(line("技术栈：Rust + GPUI + gpui-component"));
-        column = column.child(line("作者：吾爱破解 xarzhi"));
+        // 作者那一行里，「吾爱破解 xarzhi」是可以点的超链接。
+        column = column.child(
+            div()
+                .flex()
+                .justify_center()
+                .items_center()
+                .mb(px(6.0))
+                .child("作者：")
+                .child(
+                    div()
+                        .id("author_link")
+                        .cursor(CursorStyle::PointingHand)
+                        .text_color(rgb(0x1f44fa))
+                        .text_decoration_1()
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.open_url(AUTHOR_URL);
+                        }))
+                        .child("吾爱破解 xarzhi"),
+                ),
+        );
 
         // 滚动容器里只放这一列：滚动范围按这一列的真实高度算，底部的文字才滚得出来。
         // 末尾多留一段空白：换行段落的高度累计起来会差几个像素，留白了最后一行才露得出来。
         div()
             .id("about_scroll")
-            .size_full()
+            // 同上：占满剩余高度（滚动容器要有确定高度才滚得对）。
+            .flex_1()
+            .min_h(px(0.0))
             .overflow_y_scroll()
             .child(column.child(div().h(px(64.0))))
             .into_any_element()
@@ -2825,7 +2956,9 @@ impl IClick {
     /// 点小标签就能开弹窗改绑定。
     fn render_opt_two(&mut self, cx: &mut Context<Self>) -> Div {
         div()
-            .size_full()
+            // 同上：占满 tab 栏以下的剩余空间，别用 size_full。
+            .flex_1()
+            .min_h(px(0.0))
             .bg(rgb(0xf6f6f6))
             .p(px(8.0))
             .flex()
@@ -2851,16 +2984,13 @@ impl IClick {
                             }))
                             .child(self.hotkey_kbd(HotkeyAction::OptTwoRun)),
                     )
-                    .child(
-                        div()
-                            .ml(px(10.0))
-                            .text_color(rgb(0x1f44fa))
-                            .child(if self.opt_two_running {
-                                "连点中，再按一次停止"
-                            } else {
-                                ""
-                            }),
-                    ),
+                    .child(div().ml(px(10.0)).text_color(rgb(0x1f44fa)).child(
+                        if self.opt_two_running {
+                            "连点中，再按一次停止"
+                        } else {
+                            ""
+                        },
+                    )),
             )
             .child(
                 div()
@@ -2873,7 +3003,11 @@ impl IClick {
                             .ml(px(8.0))
                             .w(px(46.0))
                             .on_mouse_down(MouseButton::Left, mark_input_press)
-                            .child(Input::new(&self.click_gap_input).small().text_size(px(12.0))),
+                            .child(
+                                Input::new(&self.click_gap_input)
+                                    .small()
+                                    .text_size(px(12.0)),
+                            ),
                     )
                     .child(div().ml(px(6.0)).child("ms")),
             )
@@ -2887,7 +3021,11 @@ impl IClick {
                             .ml(px(8.0))
                             .w(px(46.0))
                             .on_mouse_down(MouseButton::Left, mark_input_press)
-                            .child(Input::new(&self.click_count_input).small().text_size(px(12.0))),
+                            .child(
+                                Input::new(&self.click_count_input)
+                                    .small()
+                                    .text_size(px(12.0)),
+                            ),
                     )
                     .child(
                         div()
@@ -3100,7 +3238,11 @@ fn key_input(vk: usize, key_up: bool) -> INPUT {
 fn ensure_foreground(hwnd: HWND) {
     unsafe {
         let top_level = GetAncestor(hwnd, GA_ROOT);
-        let target = if top_level.0.is_null() { hwnd } else { top_level };
+        let target = if top_level.0.is_null() {
+            hwnd
+        } else {
+            top_level
+        };
         if GetForegroundWindow() != target {
             let _ = SetForegroundWindow(target);
         }
@@ -3299,24 +3441,13 @@ fn send_message_mouse(hwnd: HWND, row: &MyData, point: (usize, usize)) {
 
     // 三种按键各自的按下/抬起/双击消息，以及按下时 wParam 里的按钮标志。
     let (down_message, up_message, double_message, button_flag) = match opt_type {
-        MouseOptType::左键单击 | MouseOptType::左键双击 => (
-            WM_LBUTTONDOWN,
-            WM_LBUTTONUP,
-            WM_LBUTTONDBLCLK,
-            MK_LBUTTON,
-        ),
-        MouseOptType::右键单击 | MouseOptType::右键双击 => (
-            WM_RBUTTONDOWN,
-            WM_RBUTTONUP,
-            WM_RBUTTONDBLCLK,
-            MK_RBUTTON,
-        ),
-        MouseOptType::滚轮单击 => (
-            WM_MBUTTONDOWN,
-            WM_MBUTTONUP,
-            WM_MBUTTONDBLCLK,
-            MK_MBUTTON,
-        ),
+        MouseOptType::左键单击 | MouseOptType::左键双击 => {
+            (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON)
+        }
+        MouseOptType::右键单击 | MouseOptType::右键双击 => {
+            (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON)
+        }
+        MouseOptType::滚轮单击 => (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON),
         MouseOptType::滚轮上滑 | MouseOptType::滚轮下滑 => unreachable!("滚轮上面已经返回"),
         MouseOptType::鼠标移动 => unreachable!("鼠标移动上面已经返回"),
     };
@@ -3459,6 +3590,11 @@ impl Render for IClick {
         div()
             .relative()
             .size_full()
+            // 必须是 flex 容器：上面是 tab 栏，下面各页面用 flex_1 占满剩余高度。
+            // 少了这一行就是块级布局，子元素的 flex_1 完全不生效，
+            // 页面会按内容高度排版，表格区域直接塌成 0 高。
+            .flex()
+            .flex_col()
             .text_size(px(12.0))
             // 点在输入框以外的地方就让正在编辑的输入框失焦（点在输入框里时不抢）。
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _, window, cx| {
@@ -3488,26 +3624,39 @@ impl Render for IClick {
             .child(if self.active_tab == 0 {
                 div()
                     .p(px(5.0))
+                    // 竖排：上面两块固定高度，表格占满剩下的空间。
+                    // 注意用 flex_1 而不是 size_full：根节点里上面还有一排 tab，
+                    // 用 size_full 会按整窗高度算，整页就比可用区域高出一个 tab 栏，
+                    // 表格底部会跑到窗口外面去。min_h(0) 保证内部不再按内容撑开。
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
                     .child(
                         div()
-                            .size_full()
                             .flex()
                             .mb(px(10.0))
+                            .flex_shrink_0()
+                            // 高度写死：这一行是 auto 高时子元素不会被拉伸，
+                            // 左列和右边大框就会各自按内容高度排，底边对不齐。
+                            // 250 = 左边两个框各 120 + 中间间距 10（右边大框的布局保持不变）。
+                            .h(px(250.0))
                             .child(
                                 div()
                                     .w(px(200.0))
-                                    .h(px(250.0))
                                     .mr(px(10.0))
+                                    // 和右边大框一样撑满这一行的高度：这样第二个框
+                                    // （flex_1）会自动补足，两块底边就齐平了。
+                                    .h_full()
                                     .flex()
                                     .flex_col()
                                     .child(
                                         GroupBox::new()
                                             .title("获取坐标方式一")
                                             .title_style(StyleRefinement::default().text_size(px(12.0)))
-                                            // GroupBox 默认标题和框之间隔着 16px，收窄一点。
                                             .gap(px(4.0))
-                                            .h(px(130.0))
                                             .mb(px(10.0))
+                                            .flex_1()
                                             .child(
                                                 div()
                                                     .w_full()
@@ -3520,6 +3669,8 @@ impl Render for IClick {
                                                     .flex()
                                                     .flex_col()
                                                     .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
                                                     .child(
                                                         div()
                                                             .flex()
@@ -3612,26 +3763,26 @@ impl Render for IClick {
                                     .child(
                                         GroupBox::new()
                                             .title("获取坐标方式二")
+                                            .flex_1()
                                             .title_style(
                                                 StyleRefinement::default()
                                                     .text_size(px(12.0))
-                                                    .h(px(20.0)),
                                             )
-                                            // 同上：标题贴近下面的框。
-                                            .gap(px(4.0))
-                                            .h(px(110.0))
                                             .child(
                                                 div()
                                                     .w_full()
-                                                    .h(px(80.0))
+                                                    .flex_1()
+                                            		.h_full()
                                                     .border(px(1.0))
                                                     .border_color(cx.theme().border)
                                                     .flex()
                                                     .p_1()
                                                     .flex_col()
                                                     .justify_between()
+                                                    .h(px(95.))
                                                     .child(
                                                         Checkbox::new("front_check")
+                                                            .mb(px(5.))
                                                             .label("监听热键")
                                                             .text_size(px(12.0))
                                                             .checked(self.watch_hotkey)
@@ -3654,6 +3805,7 @@ impl Render for IClick {
                                                         div()
                                                             .flex()
                                                             .items_center()
+                                                            .mb(px(5.))
                                                             .child(
                                                                 div()
                                                                     .child("鼠标事件快捷键："),
@@ -3720,7 +3872,8 @@ impl Render for IClick {
                                     .border(px(1.0))
                                     .border_color(cx.theme().border)
                                     .flex_1()
-                                    .h(px(250.0))
+                                    // 高度不写死：和左边那一列一起被拉伸到同一高度，
+                                    // 两边的底边自然就齐平了。
                                     .flex()
                                     .justify_center()
                                     .p(px(5.0))
@@ -3730,12 +3883,18 @@ impl Render for IClick {
                                             .h_full()
                                             .flex()
                                             .flex_col()
-                                            .justify_between()
+                                            // 行距统一 8px，内容从上往下排：
+                                            // 之前用 justify_between 把剩余空间平摊，而每行本身高度不同
+                                            // （带按钮的行更高），看起来就疏密不均、下面的行还被压得很低。
+                                            .gap(px(8.0))
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
 
                                                     .child(
 														div()
@@ -3811,6 +3970,9 @@ impl Render for IClick {
                                                     .items_center()
                                                     .flex()
                                                     .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
                                                     .child(
 														div()
                 										.flex()
@@ -3842,6 +4004,9 @@ impl Render for IClick {
                                                         div()
                                                             .flex()
                                                             .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
                                                             .w(px(140.0))
                                                             .child(
                                                                 Button::new("read_btn")
@@ -3880,11 +4045,25 @@ impl Render for IClick {
                                                             ),
                                                     ),
                                             )
+                                            // 只有真出错时才加这一行（None 时完全不占位，
+                                            // 否则它会白占一行高度，把「循环次数」以下的整块往下挤）。
+                                            .children(self.config_error.clone().map(|error| {
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .flex_shrink_0()
+                                                    .whitespace_normal()
+                                                    .text_color(rgb(0xd03030))
+                                                    .child(error)
+                                                    .into_any_element()
+                                            }))
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
                                                     .child(
                                                         div()
                                                             .flex()
@@ -3947,6 +4126,9 @@ impl Render for IClick {
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
                                                     .child(
 														div()
 														.flex()
@@ -3996,10 +4178,90 @@ impl Render for IClick {
                                                     ),
                                             )
                                             .child(
+                                                // 随机延迟 + 随机延迟范围，接在模糊点击/模糊范围下面。
                                                 div()
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .id("random_delay")
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                this.random_delay = !this.random_delay;
+                                                                cx.notify();
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.))
+                                                                    .text_size(px(12.0))
+                                                                    .child("随机延迟："),
+                                                            )
+                                                            .child(
+                                                                Checkbox::new("random_delay_box")
+                                                                    .label("")
+                                                                    .text_size(px(12.0))
+                                                                    .checked(self.random_delay),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .mr(px(10.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .child("随机延迟范围"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w(px(48.0))
+                                                                    .on_mouse_down(
+                                                                        MouseButton::Left,
+                                                                        mark_input_press,
+                                                                    )
+                                                                    .child(
+                                                                        Input::new(
+                                                                            &self.random_delay_min_input,
+                                                                        )
+                                                                        .small()
+                                                                        .text_size(px(12.0)),
+                                                                    ),
+                                                            )
+                                                            .child(div().mx(px(4.0)).child("~"))
+                                                            .child(
+                                                                div()
+                                                                    .w(px(48.0))
+                                                                    .on_mouse_down(
+                                                                        MouseButton::Left,
+                                                                        mark_input_press,
+                                                                    )
+                                                                    .child(
+                                                                        Input::new(
+                                                                            &self.random_delay_max_input,
+                                                                        )
+                                                                        .small()
+                                                                        .text_size(px(12.0)),
+                                                                    ),
+                                                            )
+                                                            .child(div().ml(px(6.0)).child("ms")),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    // 每行统一 26px 高：行内容有高有低（带按钮的更高），
+                                                    // 不固定高度的话行距看着还是不均匀。
+                                                    .h(px(26.0))
                                                     .child(
                                                         div()
                                                             .flex()
@@ -4148,6 +4410,7 @@ impl Render for IClick {
                         // 方案 tab（左） + 添加方案 / 清空列表（右），然后下面才是表格。
                         let scheme_names = self.data_table.read(cx).delegate().scheme_names();
                         let active_scheme = self.data_table.read(cx).delegate().active_scheme();
+                        let scheme_count = scheme_names.len();
                         div()
                             .w_full()
                             .flex()
@@ -4165,12 +4428,36 @@ impl Render for IClick {
                                     .on_click(cx.listener(|this, index, window, cx| {
                                         this.switch_scheme(*index, window, cx);
                                     }))
-                                    .children(scheme_names.into_iter().map(|name| {
-                                        Tab::new()
-                                            .label(name)
-                                            .text_size(px(12.0))
-                                            .cursor(CursorStyle::PointingHand)
-                                    })),
+                                    .children(scheme_names.into_iter().enumerate().map(
+                                        |(index, name)| {
+                                            // 标签文字用一个显式 12px 的 div 包着：
+                                            // Tab 内部会给标签套上自己的字号，外面无论怎么设
+                                            // text_size 都会被盖掉，只有写在这层才生效。
+                                            let tab = Tab::new()
+                                                .child(div().text_size(px(12.0)).child(name))
+                                                .cursor(CursorStyle::PointingHand);
+                                            // 方案一不给删，其余每个后面挂一个 ✕。
+                                            if index == 0 {
+                                                tab
+                                            } else {
+                                                tab.suffix(
+                                                    div()
+                                                        .id(("del_scheme", index))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .text_size(px(12.0))
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                // 点 ✕ 只删方案，不要顺带切成这个方案。
+                                                                cx.stop_propagation();
+                                                                this.remove_scheme(index, window, cx);
+                                                            },
+                                                        ))
+                                                        .child("✕"),
+                                                )
+                                            }
+                                        },
+                                    )),
                             )
                             .child(
                                 div()
@@ -4183,6 +4470,8 @@ impl Render for IClick {
                                             .text_size(px(12.0))
                                             .mr(px(8.0))
                                             .cursor(CursorStyle::PointingHand)
+                                            // 到 5 个就变灰，不用再弹文字提示。
+                                            .disabled(scheme_count >= MAX_SCHEMES)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.add_scheme(window, cx);
                                             })),
@@ -4199,30 +4488,17 @@ impl Render for IClick {
                                     ),
                             )
                     })
-                    .child({
-                        // 读取/保存的结果显示在表格上方，一眼能看到文件到底存哪了。
-                        let mut area = div().w_full().h(px(168.0)).flex().flex_col();
-                        if let Some(status) = self.config_status.clone() {
-                            area = area.child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .mb(px(4.0))
-                                    .flex_shrink_0()
-                                    .whitespace_normal()
-                                    .text_color(if self.config_status_error {
-                                        rgb(0xd03030)
-                                    } else {
-                                        rgb(0x1a7f37)
-                                    })
-                                    .child(status),
-                            );
-                        }
-                        area.child(
-                            div()
-                                .flex_1()
-                                .child(DataTable::new(&self.data_table).with_size(px(20.))),
-                        )
-                    })
+                    .child(
+                        // 表格占满剩下的空间（flex_1 给出确定高度，DataTable 内部自己滚动）。
+                        // min_h(0) 是必须的：否则它会按内容高度（行数多时）把整页顶出去。
+                        // 底部留 5px，不贴着窗口边。
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .mb(px(5.0))
+                            .child(DataTable::new(&self.data_table).with_size(px(20.))),
+                    )
                     .into_any_element()
             } else if self.active_tab == 1 {
                 self.render_opt_two(cx).into_any_element()
@@ -4256,7 +4532,7 @@ fn main() {
                             },
                         })),
                         titlebar: Some(TitlebarOptions {
-                            title: Some("iClick-gpui By：吾爱破解：xarzhi".into()),
+                            title: Some("iClick-gpui v1.0.0 By：吾爱破解：xarzhi".into()),
                             ..Default::default()
                         }),
                         is_resizable: false,
@@ -4295,6 +4571,17 @@ fn main() {
                         });
                         let win_hwnd_input = cx.new(|cx| InputState::new(window, cx));
                         let win_title_input = cx.new(|cx| InputState::new(window, cx));
+                        // 随机延迟范围的两个输入框（毫秒）
+                        let random_delay_min_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("50")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
+                        let random_delay_max_input = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .default_value("200")
+                                .pattern(Regex::new(r"^[0-9]\d*$").unwrap())
+                        });
                         // 操作二（纯前台连点）的输入框；开始/停止快捷键走全局快捷键
                         let click_gap_input = cx.new(|cx| {
                             InputState::new(window, cx)
@@ -4315,6 +4602,8 @@ fn main() {
                             subscribe_select_all(&y_input, cx),
                             subscribe_select_all(&win_hwnd_input, cx),
                             subscribe_select_all(&win_title_input, cx),
+                            subscribe_select_all(&random_delay_min_input, cx),
+                            subscribe_select_all(&random_delay_max_input, cx),
                             subscribe_select_all(&click_gap_input, cx),
                             subscribe_select_all(&click_count_input, cx),
                         ];
@@ -4350,12 +4639,15 @@ fn main() {
                             ],
                             loop_count_input,
                             fuzzy_round_input,
+                            random_delay: false,
+                            random_delay_min_input,
+                            random_delay_max_input,
+                            delay_random_state: random_seed(),
                             loop_gap_ipt,
                             opt_gap_ipt,
                             _input_subscriptions: input_subscriptions,
                             data_table: state,
-                            config_status: None,
-                            config_status_error: false,
+                            config_error: None,
                             always_on_top: false,
                             front_opt: false,
                             fuzzy_click: false,
@@ -4426,7 +4718,8 @@ fn main() {
                                         if should_record_move(last_move, now, x, y) {
                                             let (client_x, client_y, hwnd, title) = cursor_info();
                                             last_move = Some((now, x, y));
-                                            let delay = take_recorded_delay(&mut last_recorded_at, now);
+                                            let delay =
+                                                take_recorded_delay(&mut last_recorded_at, now);
                                             let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
                                                 opt_cate: OptCate::鼠标,
                                                 opt_type: MOUSE_MOVE_LABEL.to_string(),
@@ -4476,8 +4769,7 @@ fn main() {
                                     }
                                 } else if let EventType::Wheel { delta_y, .. } = event.event_type {
                                     // 录制模式：滚轮上滑/下滑各记一行。
-                                    if listener_record_flag.load(Ordering::Acquire)
-                                        && delta_y != 0
+                                    if listener_record_flag.load(Ordering::Acquire) && delta_y != 0
                                     {
                                         let (x, y, hwnd, title) = cursor_info();
                                         let opt_type = if delta_y > 0 {
@@ -4485,8 +4777,10 @@ fn main() {
                                         } else {
                                             MouseOptType::滚轮下滑
                                         };
-                                        let delay =
-                                            take_recorded_delay(&mut last_recorded_at, Instant::now());
+                                        let delay = take_recorded_delay(
+                                            &mut last_recorded_at,
+                                            Instant::now(),
+                                        );
                                         let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
                                             opt_cate: OptCate::鼠标,
                                             opt_type: opt_type.label().to_string(),
@@ -4510,8 +4804,10 @@ fn main() {
                                         hotkey_keys_down.remove(position);
                                     } else if listener_record_flag.load(Ordering::Acquire) {
                                         let (x, y, hwnd, title) = cursor_info();
-                                        let delay =
-                                            take_recorded_delay(&mut last_recorded_at, Instant::now());
+                                        let delay = take_recorded_delay(
+                                            &mut last_recorded_at,
+                                            Instant::now(),
+                                        );
                                         let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
                                             opt_cate: OptCate::键盘,
                                             opt_type: recorded_key_label(
@@ -4542,12 +4838,9 @@ fn main() {
                                     // 弹窗正在等新快捷键：这次按键只用来改绑定。
                                     if listener_capture_flag.load(Ordering::Acquire) {
                                         if !is_modifier {
-                                            listener_capture_flag
-                                                .store(false, Ordering::Release);
-                                            let _ =
-                                                mouse_tx.try_send(HotkeyEvent::HotkeyCaptured(
-                                                    pressed,
-                                                ));
+                                            listener_capture_flag.store(false, Ordering::Release);
+                                            let _ = mouse_tx
+                                                .try_send(HotkeyEvent::HotkeyCaptured(pressed));
                                         }
                                         return;
                                     }
@@ -4607,8 +4900,10 @@ fn main() {
                                     // 修饰键自己（它们的弹起会另记一行，这样按住的过程能还原）。
                                     if listener_record_flag.load(Ordering::Acquire) {
                                         let (x, y, hwnd, title) = cursor_info();
-                                        let delay =
-                                            take_recorded_delay(&mut last_recorded_at, Instant::now());
+                                        let delay = take_recorded_delay(
+                                            &mut last_recorded_at,
+                                            Instant::now(),
+                                        );
                                         let _ = mouse_tx.try_send(HotkeyEvent::RecordedInput {
                                             opt_cate: OptCate::键盘,
                                             opt_type: recorded_key_label(
@@ -4647,9 +4942,8 @@ fn main() {
                                     ) {
                                         hotkey_keys_down.push(plain_key.clone());
                                         let (x, y, hwnd, title) = cursor_info();
-                                        let _ = mouse_tx.try_send(HotkeyEvent::AddKeyboard(
-                                            x, y, hwnd, title,
-                                        ));
+                                        let _ = mouse_tx
+                                            .try_send(HotkeyEvent::AddKeyboard(x, y, hwnd, title));
                                     }
                                 }
                             };
@@ -4685,7 +4979,8 @@ fn main() {
                                                 view.finish_selection(window, cx);
                                             }
                                             HotkeyEvent::AddMouse(x, y, hwnd, title)
-                                                if view.watch_hotkey && view.hotkey_modal.is_none() =>
+                                                if view.watch_hotkey
+                                                    && view.hotkey_modal.is_none() =>
                                             {
                                                 view.add_hotkey_row(
                                                     window,
@@ -4700,7 +4995,8 @@ fn main() {
                                                 );
                                             }
                                             HotkeyEvent::AddKeyboard(x, y, hwnd, title)
-                                                if view.watch_hotkey && view.hotkey_modal.is_none() =>
+                                                if view.watch_hotkey
+                                                    && view.hotkey_modal.is_none() =>
                                             {
                                                 view.add_hotkey_row(
                                                     window,
@@ -4723,53 +5019,39 @@ fn main() {
                                                 view.apply_captured_hotkey(key, cx);
                                             }
                                             HotkeyEvent::LoadConfig(path) => {
-                                                match view.load_config(window, cx, &path) {
-                                                    Ok(()) => view.set_config_status(
-                                                        format!("已读取配置：{}", path.display()),
-                                                        false,
-                                                        cx,
-                                                    ),
-                                                    Err(error) => {
-                                                        view.set_config_status(error, true, cx)
-                                                    }
+                                                // 成功不提示（不占地方），失败才在按钮下面显红字。
+                                                if let Err(error) =
+                                                    view.load_config(window, cx, &path)
+                                                {
+                                                    view.set_config_error(error, cx);
+                                                } else {
+                                                    view.clear_config_error(cx);
                                                 }
                                             }
                                             HotkeyEvent::SavePicked(picked) => match picked {
                                                 Ok(Some(path)) => {
                                                     match view.save_config_to(cx, &path) {
-                                                        Ok(path) => view.set_config_status(
-                                                            format!("已保存到 {}", path.display()),
-                                                            false,
-                                                            cx,
-                                                        ),
+                                                        Ok(_) => view.clear_config_error(cx),
                                                         Err(error) => {
-                                                            view.set_config_status(error, true, cx)
+                                                            view.set_config_error(error, cx)
                                                         }
                                                     }
                                                 }
                                                 // 用户点了取消：什么都不做。
                                                 Ok(None) => {}
-                                                Err(error) => {
-                                                    view.set_config_status(error, true, cx)
-                                                }
+                                                Err(error) => view.set_config_error(error, cx),
                                             },
                                             HotkeyEvent::LoadPicked(picked) => match picked {
                                                 Ok(Some(path)) => {
                                                     match view.load_config(window, cx, &path) {
-                                                        Ok(()) => view.set_config_status(
-                                                            format!("已读取配置：{}", path.display()),
-                                                            false,
-                                                            cx,
-                                                        ),
+                                                        Ok(()) => view.clear_config_error(cx),
                                                         Err(error) => {
-                                                            view.set_config_status(error, true, cx)
+                                                            view.set_config_error(error, cx)
                                                         }
                                                     }
                                                 }
                                                 Ok(None) => {}
-                                                Err(error) => {
-                                                    view.set_config_status(error, true, cx)
-                                                }
+                                                Err(error) => view.set_config_error(error, cx),
                                             },
                                             HotkeyEvent::RecordedInput {
                                                 opt_cate,
@@ -4862,13 +5144,14 @@ fn main() {
                                                 }
 
                                                 // 行数据改了，下拉框的显示也要跟着改。
-                                                let select = view.data_table.update(cx, |table, _| {
-                                                    table
-                                                        .delegate()
-                                                        .opt_type_selects
-                                                        .last()
-                                                        .cloned()
-                                                });
+                                                let select =
+                                                    view.data_table.update(cx, |table, _| {
+                                                        table
+                                                            .delegate()
+                                                            .opt_type_selects
+                                                            .last()
+                                                            .cloned()
+                                                    });
                                                 if let Some(select) = select {
                                                     select.update(cx, |select, cx| {
                                                         select.set_selected_index(
@@ -4918,25 +5201,25 @@ mod double_click_tests {
     // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
     use super::{
         CONFIG_VERSION, ConfigFile, Duration, HWND, HotkeyAction, HotkeyConfig, HotkeySettings,
-        Instant, KeyAction, LPARAM, LEFT_DOUBLE_CLICK_LABEL, MAX_SCHEMES, MOUSE_MOVE_LABEL,
+        Instant, KeyAction, LEFT_DOUBLE_CLICK_LABEL, LPARAM, MAX_SCHEMES, MOUSE_MOVE_LABEL,
         MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
-        OptCate, OptOneConfig, OptTwoConfig, RowConfig, SchemeConfig, SendMessageW, WPARAM,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, class_accepts_double_click, config_file_stem,
-        config_save_path, double_click_gap, double_click_time_ms, fuzzy_point, hotkey_key_label,
-        hotkey_keystroke, is_double_click, is_left_double_click, keeps_clicking,
-        keyboard_row_label, parse_config, plain_key_label, random_seed, recorded_double_opt_type,
-        recorded_key_label, recorded_mouse_opt_type, schemes_of, send_message_mouse,
-        should_record_move, sleep_until_stopped, split_key_action, split_keyboard_combo,
-        take_recorded_delay, waits_between_loops, write_config_file,
+        OptCate, OptOneConfig, OptTwoConfig, RowConfig, SchemeConfig, SendMessageW, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WPARAM, class_accepts_double_click, config_file_stem, config_save_path,
+        double_click_gap, double_click_time_ms, first_free_scheme_name, fuzzy_point,
+        hotkey_key_label, hotkey_keystroke, is_double_click, is_left_double_click, keeps_clicking,
+        keyboard_row_label, parse_config, plain_key_label, random_delay_between, random_seed,
+        recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, schemes_of,
+        send_message_mouse, should_record_move, sleep_until_stopped, split_key_action,
+        split_keyboard_combo, take_recorded_delay, waits_between_loops, write_config_file,
     };
     use rdev::{Button as RdevButton, Key as RdevKey};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use windows::core::w;
     use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, HMENU, SetWindowTextW, WINDOW_EX_STYLE, WS_POPUP,
     };
+    use windows::core::w;
 
     // EM_GETSEL / EM_SETSEL 在 windows crate 的 Win32_UI_Controls 特性里，
     // 为两个稳定的消息号单独开一个特性不划算，这里直接写消息号。
@@ -5048,11 +5331,7 @@ mod double_click_tests {
         // EDIT 会把词后面的分隔符（空格）一起选进来，那属于控件自身的取舍。
         assert!(end > start, "左键双击应当选中文字");
         let selected = &"hello world"[start..end];
-        assert_eq!(
-            selected.trim_end(),
-            "hello",
-            "左键双击应当选中光标下的单词"
-        );
+        assert_eq!(selected.trim_end(), "hello", "左键双击应当选中光标下的单词");
 
         // 只发两次普通按下（缺少 WM_LBUTTONDBLCLK）不构成双击，
         // 这正是 send_message_mouse 要按类样式分支的原因。
@@ -5145,7 +5424,10 @@ mod double_click_tests {
             ctrl: true,
             ..Default::default()
         };
-        assert_eq!(hotkey_key_label(&ctrl_shift, &RdevKey::KeyA), "CTRL+SHIFT+A");
+        assert_eq!(
+            hotkey_key_label(&ctrl_shift, &RdevKey::KeyA),
+            "CTRL+SHIFT+A"
+        );
         // 和按下的先后顺序无关。
         assert_eq!(
             hotkey_key_label(&ctrl_shift, &RdevKey::KeyA),
@@ -5158,7 +5440,10 @@ mod double_click_tests {
             alt: true,
             meta: true,
         };
-        assert_eq!(hotkey_key_label(&all, &RdevKey::F1), "CTRL+SHIFT+ALT+WIN+F1");
+        assert_eq!(
+            hotkey_key_label(&all, &RdevKey::F1),
+            "CTRL+SHIFT+ALT+WIN+F1"
+        );
 
         // 绑定比对忽略大小写，但修饰键必须完全一致：Ctrl+F8 不该触发只绑了 F8 的操作。
         assert!(HotkeySettings::matches("CTRL+SHIFT+A", "ctrl+shift+a"));
@@ -5297,7 +5582,8 @@ mod double_click_tests {
 
     /// 鼠标轨迹抽稀：间隔太短或没怎么动都不记。
     #[test]
-    fn mouse_moves_are_thinned_out() {        let start = Instant::now();
+    fn mouse_moves_are_thinned_out() {
+        let start = Instant::now();
 
         // 第一条（录制开始后的第一次移动）总要记。
         assert!(should_record_move(None, start, 10.0, 10.0));
@@ -5368,6 +5654,9 @@ mod double_click_tests {
                 always_on_top: true,
                 front_opt: true,
                 fuzzy_click: true,
+                random_delay: true,
+                random_delay_min: "30".to_string(),
+                random_delay_max: "90".to_string(),
                 fuzzy_round: "5".to_string(),
                 loop_count: "3".to_string(),
                 loop_gap: "200".to_string(),
@@ -5536,10 +5825,8 @@ mod double_click_tests {
             }],
         };
 
-        let path = std::env::temp_dir().join(format!(
-            "iclick_config_test_{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("iclick_config_test_{}.json", std::process::id()));
         write_config_file(&config, &path).expect("能写文件");
         let text = std::fs::read_to_string(&path).expect("能读回文件");
         let _ = std::fs::remove_file(&path);
@@ -5553,11 +5840,16 @@ mod double_click_tests {
     /// 别人的 json / 内容不合法的 json 都要被挡下来。
     #[test]
     fn parse_config_rejects_foreign_and_broken_files() {
-        assert!(parse_config("{\"hello\": \"world\"}").is_err(), "缺 version");
+        assert!(
+            parse_config("{\"hello\": \"world\"}").is_err(),
+            "缺 version"
+        );
         assert!(parse_config("not json at all").is_err(), "压根不是 json");
         assert!(
-            parse_config(r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"鼠标","opt_type":"乱写"}]}"#)
-                .is_err(),
+            parse_config(
+                r#"{"version":1,"rows":[{"x":1,"y":2,"opt_cate":"鼠标","opt_type":"乱写"}]}"#
+            )
+            .is_err(),
             "操作方式不认识"
         );
         assert!(
@@ -5588,7 +5880,11 @@ mod double_click_tests {
             opt_one: OptOneConfig::default(),
             opt_two: OptTwoConfig::default(),
             hotkeys: HotkeyConfig::default(),
-            schemes: vec![scheme("方案一", 1), scheme("方案二", 2), scheme("方案三", 3)],
+            schemes: vec![
+                scheme("方案一", 1),
+                scheme("方案二", 2),
+                scheme("方案三", 3),
+            ],
             active_scheme: 2,
             rows: vec![],
         };
@@ -5616,10 +5912,8 @@ mod double_click_tests {
         assert_eq!(schemes[0].rows[0].x, 9);
 
         // 方案名空着就按顺序补，超过 5 个方案要报错。
-        let unnamed: ConfigFile = parse_config(
-            r#"{"version":2,"schemes":[{"rows":[]},{"rows":[]}]}"#,
-        )
-        .expect("能解析");
+        let unnamed: ConfigFile =
+            parse_config(r#"{"version":2,"schemes":[{"rows":[]},{"rows":[]}]}"#).expect("能解析");
         let schemes = schemes_of(&unnamed);
         assert_eq!(schemes[0].name, "方案一");
         assert_eq!(schemes[1].name, "方案二");
@@ -5631,7 +5925,7 @@ mod double_click_tests {
             opt_two: OptTwoConfig::default(),
             hotkeys: HotkeyConfig::default(),
             schemes: (0..MAX_SCHEMES + 1)
-                .map(|index| SchemeConfig {
+                .map(|_| SchemeConfig {
                     name: String::new(),
                     rows: vec![],
                 })
@@ -5649,6 +5943,47 @@ mod double_click_tests {
         .expect("能解析");
         let error = bad_row.validate().expect_err("应当报错");
         assert!(error.contains("方案二"), "报错要指明方案：{error}");
+    }
+
+    /// 随机延迟：取出来的值一定落在范围内；范围填反了照样能用；上下限相等就是定值。
+    #[test]
+    fn random_delay_stays_inside_the_range() {
+        let mut seed = 0x1234_5678_9abc_def0_u64;
+        for _ in 0..200 {
+            let value = random_delay_between(&mut seed, 100, 200);
+            assert!((100..=200).contains(&value), "越界了：{value}");
+        }
+        // 上下限相等 → 就是那个数
+        assert_eq!(random_delay_between(&mut seed, 77, 77), 77);
+        // 范围填反 → 按小的那个当唯一下限（max <= min 时取 min）
+        assert_eq!(random_delay_between(&mut seed, 30, 10), 30);
+        // 0..=0 是合法的（不加延迟）
+        assert_eq!(random_delay_between(&mut seed, 0, 0), 0);
+        // 多次取值不应该永远一样
+        let values: Vec<usize> = (0..50)
+            .map(|_| random_delay_between(&mut seed, 0, 1000))
+            .collect();
+        assert!(
+            values.iter().any(|value| *value != values[0]),
+            "随机延迟应当有变化：{values:?}"
+        );
+    }
+
+    /// 新方案取名：删掉中间那个方案后，再添加应该补上空出来的名字，而不是撞名。
+    #[test]
+    fn new_scheme_names_fill_the_gaps() {
+        assert_eq!(first_free_scheme_name(&[]), "方案一");
+        assert_eq!(first_free_scheme_name(&["方案一"]), "方案二");
+        assert_eq!(first_free_scheme_name(&["方案一", "方案三"]), "方案二");
+        assert_eq!(
+            first_free_scheme_name(&["方案一", "方案二", "方案四", "方案五"]),
+            "方案三"
+        );
+        assert_eq!(
+            first_free_scheme_name(&["方案一", "方案二", "方案三", "方案四", "方案五"]),
+            "方案一",
+            "五个都占满时兜底返回方案一（调用方本来就该拦住）"
+        );
     }
 
     /// 修饰键自己不成一次操作，只用来拼组合键。
@@ -5846,7 +6181,8 @@ mod double_click_tests {
 
     /// 操作二连点：次数 0 一直点，次数 N 点满就停，按了停止立刻不点。
     #[test]
-    fn opt_two_clicks_until_stopped_or_counted_out() {        assert!(keeps_clicking(true, 0, 0));
+    fn opt_two_clicks_until_stopped_or_counted_out() {
+        assert!(keeps_clicking(true, 0, 0));
         assert!(keeps_clicking(true, 0, 9999));
 
         assert!(keeps_clicking(true, 3, 0));
