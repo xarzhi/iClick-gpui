@@ -4417,7 +4417,7 @@ impl Render for IClick {
                             .items_center()
                             .justify_between()
                             .flex_shrink_0()
-                            .mt(px(8.0))
+                            // .mt(px(8.0))
                             .mb(px(6.0))
                             .child(
                                 TabBar::new("scheme_tabs")
@@ -4446,6 +4446,7 @@ impl Render for IClick {
                                                         .cursor(CursorStyle::PointingHand)
                                                         .text_size(px(12.0))
                                                         .text_color(cx.theme().muted_foreground)
+                                                        .pr_1()
                                                         .on_click(cx.listener(
                                                             move |this, _, window, cx| {
                                                                 // 点 ✕ 只删方案，不要顺带切成这个方案。
