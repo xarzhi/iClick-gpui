@@ -72,43 +72,53 @@ const RELEASE_PAGE: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
 const VERSION_URL: &str =
     "https://raw.giteeusercontent.com/xarzhi/i-click-gpui/raw/master/version.json";
 
-/// 当前程序版本：和 version.json 里的版本比大小。发版时这里和窗口标题一起改。
-const APP_VERSION: &str = "1.2.0";
+/// 当前程序版本：直接取 Cargo.toml 里的 version，整个程序只有这一处版本号。
+/// 发版时只改 Cargo.toml —— 窗口标题、设置页、更新比对全都跟着走。
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 自动检测更新的方式。
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
 enum UpdateCheckMode {
     /// 每次启动都检测
-    EveryStart,
-    /// 每天第一次启动时检测
     #[default]
-    DailyFirst,
+    EveryStart,
     /// 不自动检测（还能手动点「检测更新」）
     Never,
+    /// 老配置里存过 "DailyFirst"（每天首次启动检测）。这个选项已经去掉了
+    /// （它会额外产生一个记录日期的文件），读到就当成「每次启动检测」。
+    #[serde(other)]
+    LegacyDailyFirst,
 }
 
 impl UpdateCheckMode {
-    /// 设置页里那三个单选，顺序就是下标。
-    const ALL: [UpdateCheckMode; 3] = [
-        UpdateCheckMode::EveryStart,
-        UpdateCheckMode::DailyFirst,
-        UpdateCheckMode::Never,
-    ];
+    /// 设置页里的两个单选，顺序就是下标。
+    const ALL: [UpdateCheckMode; 2] = [UpdateCheckMode::EveryStart, UpdateCheckMode::Never];
 
     fn label(self) -> &'static str {
         match self {
-            Self::EveryStart => "每次启动检测",
-            Self::DailyFirst => "每天首次启动检测",
+            Self::EveryStart | Self::LegacyDailyFirst => "每次启动检测",
             Self::Never => "不自动检测",
         }
     }
 
+    /// 设置页里选中哪个（老值按「每次启动」高亮）。
     fn index(self) -> usize {
-        Self::ALL.iter().position(|mode| *mode == self).unwrap_or(1)
+        Self::ALL
+            .iter()
+            .position(|mode| *mode == self)
+            .unwrap_or(0)
     }
 
     fn from_index(index: usize) -> Self {
         Self::ALL.get(index).copied().unwrap_or_default()
+    }
+
+    /// 启动时要不要自动检测。
+    fn checks_on_start(self) -> bool {
+        match self {
+            Self::EveryStart | Self::LegacyDailyFirst => true,
+            Self::Never => false,
+        }
     }
 }
 
@@ -214,28 +224,6 @@ fn fetch_latest_release() -> Result<ReleaseInfo, String> {
             download_url: RELEASE_PAGE.to_string(),
         })
     }
-}
-
-/// 今天的日期（YYYY-MM-DD），给「每天首次启动检测」判断用。
-fn today_text() -> String {
-    let time = unsafe { GetLocalTime() };
-    format!("{:04}-{:02}-{:02}", time.wYear, time.wMonth, time.wDay)
-}
-
-/// 上次自动检测的日期记在程序目录的小文件里。
-/// 单独存一份是为了不依赖「配置文件有没有被保存过」。
-fn last_check_path() -> PathBuf {
-    app_dir().join("iclick_last_update_check.txt")
-}
-
-fn read_last_check_date() -> Option<String> {
-    std::fs::read_to_string(last_check_path())
-        .ok()
-        .map(|text| text.trim().to_string())
-}
-
-fn write_last_check_date(date: &str) {
-    let _ = std::fs::write(last_check_path(), date);
 }
 
 /// 关于页里的两张收款码：资源路径 + include_bytes! 进来的图。
@@ -5083,7 +5071,10 @@ fn main() {
                             },
                         })),
                         titlebar: Some(TitlebarOptions {
-                            title: Some("iClick-gpui v1.2.0 By：吾爱破解：xarzhi".into()),
+                            // 版本号跟着 Cargo.toml 走，不要在这里写死
+                            title: Some(
+                                format!("iClick-gpui v{APP_VERSION} By：吾爱破解：xarzhi").into(),
+                            ),
                             ..Default::default()
                         }),
                         is_resizable: false,
@@ -5621,20 +5612,9 @@ fn main() {
                                             }
                                             HotkeyEvent::CheckUpdateOnStart => {
                                                 // 按设置决定要不要自动检测：
-                                                //   每次启动 → 每次都查
-                                                //   每天首次 → 上次查的日期不是今天就查
+                                                //   每次启动 → 查
                                                 //   不自动检测 → 不查（还能手动点按钮）
-                                                let today = today_text();
-                                                let should_check = match view.update_check_mode {
-                                                    UpdateCheckMode::EveryStart => true,
-                                                    UpdateCheckMode::DailyFirst => {
-                                                        read_last_check_date().as_deref()
-                                                            != Some(today.as_str())
-                                                    }
-                                                    UpdateCheckMode::Never => false,
-                                                };
-                                                if should_check {
-                                                    write_last_check_date(&today);
+                                                if view.update_check_mode.checks_on_start() {
                                                     view.check_update(false, cx);
                                                 }
                                             }
@@ -6600,33 +6580,44 @@ mod double_click_tests {
         assert!(!version_is_newer("乱七八糟", "1.2.0"), "认不出来就不提示");
     }
 
-    /// 更新检测方式：存进配置、读回来还是那个；设置页下标来回也对得上。
+    /// 更新检测方式：只剩「每次启动」和「不自动检测」两项；
+    /// 老配置里的 "DailyFirst" 要能读进来，并按「每次启动」处理。
     #[test]
     fn update_check_mode_survives_the_config() {
         for mode in UpdateCheckMode::ALL {
             assert_eq!(UpdateCheckMode::from_index(mode.index()), mode);
         }
-        assert_eq!(UpdateCheckMode::default(), UpdateCheckMode::DailyFirst);
+        assert_eq!(UpdateCheckMode::default(), UpdateCheckMode::EveryStart);
+        assert_eq!(UpdateCheckMode::ALL.len(), 2, "设置页只留两项");
+        assert!(UpdateCheckMode::EveryStart.checks_on_start());
+        assert!(!UpdateCheckMode::Never.checks_on_start());
 
-        let mut config = ConfigFile {
+        let config = ConfigFile {
             version: CONFIG_VERSION,
             saved_at: String::new(),
             opt_one: OptOneConfig::default(),
             opt_two: OptTwoConfig::default(),
             hotkeys: HotkeyConfig::default(),
-            update_check_mode: UpdateCheckMode::EveryStart,
+            update_check_mode: UpdateCheckMode::Never,
             schemes: Vec::new(),
             active_scheme: 0,
             rows: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&config).expect("能序列化");
         let restored = parse_config(&json).expect("能读回来");
-        assert_eq!(restored.update_check_mode, UpdateCheckMode::EveryStart);
+        assert_eq!(restored.update_check_mode, UpdateCheckMode::Never);
 
-        // 老配置没有这个字段 → 用默认值（每天首次）
-        config.update_check_mode = UpdateCheckMode::Never;
+        // 老配置没有这个字段 → 用默认值（每次启动检测）
         let old: ConfigFile = parse_config(r#"{"version":2}"#).expect("老配置能读");
-        assert_eq!(old.update_check_mode, UpdateCheckMode::DailyFirst);
+        assert_eq!(old.update_check_mode, UpdateCheckMode::EveryStart);
+
+        // 老配置里存着已去掉的 DailyFirst → 读得进来，并且按「每次启动」处理
+        let legacy: ConfigFile =
+            parse_config(r#"{"version":2,"update_check_mode":"DailyFirst"}"#).expect("老值能读");
+        assert_eq!(legacy.update_check_mode, UpdateCheckMode::LegacyDailyFirst);
+        assert!(legacy.update_check_mode.checks_on_start());
+        assert_eq!(legacy.update_check_mode.index(), 0, "高亮回「每次启动」");
+
         assert_eq!(
             serde_json::to_string(&UpdateCheckMode::Never).unwrap(),
             "\"Never\""
