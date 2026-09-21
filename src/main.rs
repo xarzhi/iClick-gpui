@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -15,7 +15,7 @@ use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::*;
-use gpui_component::{Icon, IconName};
+use gpui_component::Icon;
 use rdev::{Button as RdevButton, Event, EventType, Key as RdevKey, listen};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -67,6 +67,10 @@ const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
     ("payment/wechat.png", include_bytes!("assets/wechat.png")),
     ("payment/alipay.png", include_bytes!("assets/zhi-pay.png")),
 ];
+
+/// 「获取坐标方式一」里那个准心图标（按下拖到目标区域松手即可取坐标）。
+/// 素材是 src/assets/aim.svg，用 gpui 的 img() 按资源路径渲染。
+const AIM_ICON: &str = "icons/aim.svg";
 
 /// 配置文件格式版本：以后结构变了可以按版本兼容。
 /// 1 → 2：操作列表从一份变成多方案（v1 的老配置读进来就是「方案一」）。
@@ -301,6 +305,25 @@ fn random_delay_between(seed: &mut u64, min: usize, max: usize) -> usize {
     }
     let span = (max - min + 1) as u64;
     min + (next_random(seed) % span) as usize
+}
+
+/// 一次操作执行前要等多久。
+///
+/// 勾了「随机延迟」：忽略表格里那一行存的延迟，**每次都现场取一个**随机值 ——
+/// 所以同一行执行多次、跑到第几轮，延迟都是各不相同的；等完这个随机延迟才发操作。
+/// 没勾：用这一行存的值（录制出来的就是「距上一个操作过了多久」）。
+fn operation_delay(
+    random_delay: bool,
+    min: usize,
+    max: usize,
+    row_delay: usize,
+    seed: &mut u64,
+) -> usize {
+    if random_delay {
+        random_delay_between(seed, min, max)
+    } else {
+        row_delay
+    }
 }
 
 /// 本机当前日期，用来拼配置文件名：iclick_config_2025_09_18.json。
@@ -595,6 +618,11 @@ impl AppAssets {
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if path == AIM_ICON {
+            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "assets/aim.svg"
+            ))));
+        }
         if let Some((_, bytes)) = PAYMENT_IMAGES
             .iter()
             .find(|(resource, _)| *resource == path)
@@ -749,12 +777,11 @@ pub struct IClick {
     win_title_input: Entity<InputState>,
     loop_count_input: Entity<InputState>,  // 循环次数
     fuzzy_round_input: Entity<InputState>, // 模糊范围
-    /// 随机延迟：勾上以后新加进来的行，延迟在下面这个范围里随机取。
+    /// 随机延迟：勾上以后表格里的「延迟」列不生效，
+    /// 每次操作执行前现场在下面这个范围里取一个随机延迟。
     random_delay: bool,
     random_delay_min_input: Entity<InputState>, // 随机延迟范围下限
     random_delay_max_input: Entity<InputState>, // 随机延迟范围上限
-    /// 取随机延迟用的状态（xorshift）。
-    delay_random_state: u64,
     loop_gap_ipt: Entity<InputState>, // 循环间隔
     opt_gap_ipt: Entity<InputState>,  // 操作间隔
     // 操作二（纯前台连点）的输入框；开始/停止快捷键用的是全局快捷键，没有输入框。
@@ -918,11 +945,11 @@ impl HotkeyAction {
     /// 弹窗里显示的操作名。
     fn label(self) -> &'static str {
         match self {
-            Self::Record => "开始录制",
-            Self::ToggleRun => "开始/暂停",
-            Self::MouseEvent => "鼠标事件",
-            Self::KeyboardEvent => "键盘事件",
-            Self::OptTwoRun => "操作二开始/停止",
+            Self::Record => "开始录制：",
+            Self::ToggleRun => "开始/暂停：",
+            Self::MouseEvent => "鼠标事件：",
+            Self::KeyboardEvent => "键盘事件：",
+            Self::OptTwoRun => "操作二开始/停止：",
         }
     }
 }
@@ -2152,6 +2179,10 @@ impl IClick {
             0
         };
         let front_opt = self.front_opt;
+        // 随机延迟：勾上以后表格里的「延迟」列不生效，
+        // 每次操作（不管第几轮、第几次）都现取一个范围内的随机延迟，等完再执行。
+        let random_delay = self.random_delay;
+        let (random_delay_min, random_delay_max) = self.random_delay_range(cx);
 
         self.is_running = true;
         self.execution_flag.store(true, Ordering::Release);
@@ -2159,11 +2190,32 @@ impl IClick {
         let execution_event_tx = self.execution_event_tx.clone();
         thread::spawn(move || {
             let mut completed_loops = 0;
-            // 每个执行线程自己一份随机种子，模糊点击用它取点位。
+            // 每个执行线程自己一份随机种子，模糊点击和随机延迟都用它。
             let mut random_seed = random_seed();
             let mut operation_gap = OperationGap::new(opt_gap);
+            // 随机延迟的日志：每次运行重写，记下每个操作当场取到的值。
+            let mut delay_log = if random_delay {
+                let path = app_dir().join("iclick_delay.log");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .ok()
+                    .map(|mut file| {
+                        let _ = writeln!(
+                            file,
+                            "随机延迟 {random_delay_min}~{random_delay_max} ms，共 {} 行，循环 {} 轮（0 = 无限）",
+                            rows.len(),
+                            loop_count
+                        );
+                        file
+                    })
+            } else {
+                None
+            };
             while loop_count == 0 || completed_loops < loop_count {
-                for row in &rows {
+                for (row_ix, row) in rows.iter().enumerate() {
                     if !execution_flag.load(Ordering::Acquire) {
                         break;
                     }
@@ -2171,18 +2223,41 @@ impl IClick {
                     let Some(hwnd) = parse_hwnd(&row.win_hwnd) else {
                         continue;
                     };
-                    for _ in 0..row.execute_time.max(1) {
+                    for exec_ix in 0..row.execute_time.max(1) {
                         if !execution_flag.load(Ordering::Acquire) {
                             break;
                         }
 
-                        // 这一行自己的延迟：录制出来的值就是「距上一个操作过了多久」，
-                        // 所以先等它，再等全局的操作间隔，然后才发这次操作。
-                        // 这样回放的节奏和录制时一致，最后一行也不会多等一次。
-                        if row.delay > 0
+                        // 这一次操作要等多久：
+                        //  - 开了「随机延迟」：现场在范围内取一个随机值（用执行线程自己的随机流，
+                        //    所以每一轮的第几次都各不相同），表格里的「延迟」列此时不生效；
+                        //  - 没开：用这一行自己的延迟。录制出来的值就是「距上一个操作过了多久」，
+                        //    所以先等它，再等全局的操作间隔，然后才发这次操作 ——
+                        //    回放节奏和录制时一致，最后一行也不会多等一次。
+                        let delay = operation_delay(
+                            random_delay,
+                            random_delay_min,
+                            random_delay_max,
+                            row.delay,
+                            &mut random_seed,
+                        );
+                        // GUI 没有控制台，随机延迟取到的值写到程序目录的日志里，方便核对。
+                        if random_delay
+                            && let Some(log) = delay_log.as_mut()
+                        {
+                            let _ = writeln!(
+                                log,
+                                "第 {} 轮  第 {} 行  第 {} 次  随机延迟 {} ms",
+                                completed_loops + 1,
+                                row_ix + 1,
+                                exec_ix + 1,
+                                delay
+                            );
+                        }
+                        if delay > 0
                             && !sleep_until_stopped(
                                 &execution_flag,
-                                Duration::from_millis(row.delay as u64),
+                                Duration::from_millis(delay as u64),
                             )
                         {
                             break;
@@ -2271,13 +2346,9 @@ impl IClick {
             input.set_value(&title, window, cx);
         });
 
-        // 勾了「随机延迟」就不用录制到的那个间隔，改成在设定范围里随手取一个。
-        let delay = if self.random_delay {
-            let (min, max) = self.random_delay_range(cx);
-            random_delay_between(&mut self.delay_random_state, min, max)
-        } else {
-            recorded_delay
-        };
+        // 延迟就照原样写进表格（录制的是真实间隔，热键插的行是 0）。
+        // 「随机延迟」不在这里动手脚：它是在执行时每次现取，表格这一列不生效。
+        let delay = recorded_delay;
 
         // 录制出来的行带着当时用的操作方式，热键插的行用默认值。
         let opt_type = opt_type.unwrap_or_else(|| default_opt_type(&opt_cate));
@@ -2317,13 +2388,8 @@ impl IClick {
         };
         let opt_type = default_opt_type(&opt_cate);
 
-        // 和快捷键插行一样：勾了「随机延迟」就在范围里随机取一个。
-        let delay = if self.random_delay {
-            let (min, max) = self.random_delay_range(cx);
-            random_delay_between(&mut self.delay_random_state, min, max)
-        } else {
-            0
-        };
+        // 十字取坐标插的行，延迟照旧是 0（「随机延迟」在执行时才现取，不写进表格）。
+        let delay = 0;
 
         let data = MyData {
             x,
@@ -3679,8 +3745,8 @@ impl Render for IClick {
                                                                 div()
                                                                     .border(px(1.0))
                                                                     .border_color(cx.theme().border)
-                                                                    .w(px(30.))
-                                                                    .h(px(30.))
+                                                                    .w(px(32.))
+                                                                    .h(px(32.))
                                                                     .cursor(CursorStyle::Crosshair)
                                                                     .on_mouse_down(
                                                                         MouseButton::Left,
@@ -3704,15 +3770,35 @@ impl Render for IClick {
                                                                         }),
                                                                     )
                                                                     .child(
-                                                                        Icon::new(IconName::Plus)
-                                                                            .size_full()
-                                                                            .text_color(rgb(0x1f44fa)),
+                                                                        div()
+                                                                            .w_full()
+                                                                            .h_full()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .justify_center()
+                                                                            .child(
+                                                                                // 用组件库的 Icon + 单色矢量图：
+                                                                                // 它内部走 svg() 渲染（和界面其它图标同一套），
+                                                                                // 边缘平滑、随尺寸缩放都锐利；img() 是按像素光栅化的，
+                                                                                // 这种细线图标在那个尺寸下会出锯齿。
+                                                                                Icon::default()
+                                                                                    .path(AIM_ICON)
+                                                                                    .text_color(rgb(0x1f44fa))
+                                                                                    .flex_none()
+                                                                                    .w(px(24.0))
+                                                                                    .h(px(24.0)),
+                                                                            ),
                                                                     ),
                                                             )
                                                             .child(
                                                                 div()
                                                                     .ml(px(8.0))
-                                                                    .child(self.is_choosing.to_string()),
+                                                                    .flex_1()
+                                                                    // flex 子项默认 min-width:auto，文字不会换行，
+                                                                    // 会把这一行撑出去；给 0 才会按可用宽度折行。
+                                                                    .min_w(px(0.0))
+                                                                    .whitespace_normal()
+                                                                    .child("按下移至目标区域松开即可选取"),
                                                             ),
                                                     )
                                                     .child(
@@ -4074,7 +4160,7 @@ impl Render for IClick {
                                                                     .child("循环次数：")
 																	.id("loop_count_tooltip")
 																	.tooltip(|window, cx| {
-																			Tooltip::new("表格中所有操作的总执行次数，0代表无限次")
+																			Tooltip::new("表格中所有操作要执行多少轮，0代表无限次")
 																				.text_size(px(12.0))
 																				.build(window, cx)
 																	}),
@@ -4218,7 +4304,7 @@ impl Render for IClick {
                                                                     .mr(px(10.0))
                                                                     .flex()
                                                                     .items_center()
-                                                                    .child("随机延迟范围"),
+                                                                    .child("随机延迟范围："),
                                                             )
                                                             .child(
                                                                 div()
@@ -4284,7 +4370,7 @@ impl Render for IClick {
                                                                     .mr(px(10.0))
                                                                     .flex()
                                                                     .items_center()
-                                                                    .child("循环间隔"),
+                                                                    .child("循环间隔："),
                                                             )
                                                             .child(
                                                                 div().w(px(80.0)).on_mouse_down(MouseButton::Left, mark_input_press).child(
@@ -4533,7 +4619,7 @@ fn main() {
                             },
                         })),
                         titlebar: Some(TitlebarOptions {
-                            title: Some("iClick-gpui v1.0.0 By：吾爱破解：xarzhi".into()),
+                            title: Some("iClick-gpui v1.1.0 By：吾爱破解：xarzhi".into()),
                             ..Default::default()
                         }),
                         is_resizable: false,
@@ -4643,7 +4729,6 @@ fn main() {
                             random_delay: false,
                             random_delay_min_input,
                             random_delay_max_input,
-                            delay_random_state: random_seed(),
                             loop_gap_ipt,
                             opt_gap_ipt,
                             _input_subscriptions: input_subscriptions,
@@ -5208,8 +5293,8 @@ mod double_click_tests {
         WM_LBUTTONUP, WPARAM, class_accepts_double_click, config_file_stem, config_save_path,
         double_click_gap, double_click_time_ms, first_free_scheme_name, fuzzy_point,
         hotkey_key_label, hotkey_keystroke, is_double_click, is_left_double_click, keeps_clicking,
-        keyboard_row_label, parse_config, plain_key_label, random_delay_between, random_seed,
-        recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, schemes_of,
+        keyboard_row_label, operation_delay, parse_config, plain_key_label, random_delay_between,
+        random_seed, recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, schemes_of,
         send_message_mouse, should_record_move, sleep_until_stopped, split_key_action,
         split_keyboard_combo, take_recorded_delay, waits_between_loops, write_config_file,
     };
@@ -5967,6 +6052,28 @@ mod double_click_tests {
         assert!(
             values.iter().any(|value| *value != values[0]),
             "随机延迟应当有变化：{values:?}"
+        );
+    }
+
+    /// 随机延迟是在执行时逐次现取的：开了就忽略表格里的值、每次都重新随机；
+    /// 没开就用行里存的值。
+    #[test]
+    fn random_delay_is_drawn_per_operation_at_run_time() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        // 没开：用行里的值
+        assert_eq!(operation_delay(false, 10, 20, 777, &mut seed), 777);
+
+        // 开了：忽略行里的值，每次都落在范围内，而且不是同一个数
+        let values: Vec<usize> = (0..40)
+            .map(|_| operation_delay(true, 10, 20, 777, &mut seed))
+            .collect();
+        assert!(
+            values.iter().all(|value| (10..=20).contains(value)),
+            "都要落在范围内：{values:?}"
+        );
+        assert!(
+            values.iter().any(|value| *value != values[0]),
+            "每次操作都应重新随机：{values:?}"
         );
     }
 
