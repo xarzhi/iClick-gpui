@@ -1,4 +1,4 @@
-// #![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 use gpui::Bounds;
 use gpui::SharedString;
 use gpui::WindowOptions;
@@ -27,6 +27,11 @@ use std::time::{Duration, Instant};
 use std::vec;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Networking::WinInet::{
+    INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_FLAG_SECURE,
+    INTERNET_OPEN_TYPE_PRECONFIG, InternetCloseHandle, InternetOpenUrlW, InternetOpenW,
+    InternetReadFile,
+};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -62,6 +67,177 @@ const DOWNLOAD_URL: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
 /// 关于页里的作者主页。
 const AUTHOR_URL: &str = "https://www.52pojie.cn/home.php?mod=space&uid=2283786";
 
+/// 发布页、以及查最新版本的地址（仓库根目录的 version.json，内容形如 {"version":"v1.2.0"}）。
+const RELEASE_PAGE: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
+const VERSION_URL: &str =
+    "https://raw.giteeusercontent.com/xarzhi/i-click-gpui/raw/master/version.json";
+
+/// 当前程序版本：和 version.json 里的版本比大小。发版时这里和窗口标题一起改。
+const APP_VERSION: &str = "1.2.0";
+
+/// 自动检测更新的方式。
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+enum UpdateCheckMode {
+    /// 每次启动都检测
+    EveryStart,
+    /// 每天第一次启动时检测
+    #[default]
+    DailyFirst,
+    /// 不自动检测（还能手动点「检测更新」）
+    Never,
+}
+
+impl UpdateCheckMode {
+    /// 设置页里那三个单选，顺序就是下标。
+    const ALL: [UpdateCheckMode; 3] = [
+        UpdateCheckMode::EveryStart,
+        UpdateCheckMode::DailyFirst,
+        UpdateCheckMode::Never,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::EveryStart => "每次启动检测",
+            Self::DailyFirst => "每天首次启动检测",
+            Self::Never => "不自动检测",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|mode| *mode == self).unwrap_or(1)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or_default()
+    }
+}
+
+/// 版本号解析："v1.2.0"、"1.2.0"、"V1.2" 都能认；认不出来返回 None。
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = text.trim().trim_start_matches(['v', 'V']);
+    let mut parts = trimmed.split('.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").trim().parse::<u64>().unwrap_or(0);
+    let patch = parts.next().unwrap_or("0").trim().parse::<u64>().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// version.json 里的版本是不是比当前的新。
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        // 版本号认不出来时别乱提示
+        _ => false,
+    }
+}
+
+/// 从版本文件拿到的信息。
+struct ReleaseInfo {
+    tag: String,
+    download_url: String,
+}
+
+/// 拉取仓库里的 version.json（Gitee 的 raw 地址）。走系统自带的 WinINet，不额外引依赖。
+/// 注意：这是阻塞调用，要放在后台线程里跑。
+fn fetch_latest_release() -> Result<ReleaseInfo, String> {
+    let agent: Vec<u16> = "iClick-gpui"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let url: Vec<u16> = VERSION_URL
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let session = InternetOpenW(
+            windows::core::PCWSTR(agent.as_ptr()),
+            INTERNET_OPEN_TYPE_PRECONFIG.0,
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err("打不开网络会话".to_string());
+        }
+        let handle = InternetOpenUrlW(
+            session,
+            windows::core::PCWSTR(url.as_ptr()),
+            None,
+            INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE,
+            0,
+        );
+        if handle.is_null() {
+            let _ = InternetCloseHandle(session);
+            return Err("连接版本文件失败，检查一下网络".to_string());
+        }
+
+        let mut body: Vec<u8> = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let mut read = 0u32;
+            if InternetReadFile(
+                handle,
+                buffer.as_mut_ptr() as *mut _,
+                buffer.len() as u32,
+                &mut read,
+            )
+            .is_err()
+            {
+                break;
+            }
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buffer[..read as usize]);
+        }
+        let _ = InternetCloseHandle(handle);
+        let _ = InternetCloseHandle(session);
+
+        let text = String::from_utf8_lossy(&body);
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|_| "版本文件返回的内容看不懂，稍后再试".to_string())?;
+        // 现在的版本文件就一个字段：{"version": "v1.2.0"}。
+        // 顺手兼容一下老格式的 tag_name，读不到再说。
+        let tag = json
+            .get("version")
+            .or_else(|| json.get("tag_name"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if tag.is_empty() {
+            return Err("版本文件里没有版本号".to_string());
+        }
+        // 版本文件里没有下载直链，统一跳发布页（那里有 Release 和附件）。
+        Ok(ReleaseInfo {
+            tag,
+            download_url: RELEASE_PAGE.to_string(),
+        })
+    }
+}
+
+/// 今天的日期（YYYY-MM-DD），给「每天首次启动检测」判断用。
+fn today_text() -> String {
+    let time = unsafe { GetLocalTime() };
+    format!("{:04}-{:02}-{:02}", time.wYear, time.wMonth, time.wDay)
+}
+
+/// 上次自动检测的日期记在程序目录的小文件里。
+/// 单独存一份是为了不依赖「配置文件有没有被保存过」。
+fn last_check_path() -> PathBuf {
+    app_dir().join("iclick_last_update_check.txt")
+}
+
+fn read_last_check_date() -> Option<String> {
+    std::fs::read_to_string(last_check_path())
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+fn write_last_check_date(date: &str) {
+    let _ = std::fs::write(last_check_path(), date);
+}
+
 /// 关于页里的两张收款码：资源路径 + include_bytes! 进来的图。
 const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
     ("payment/wechat.png", include_bytes!("assets/wechat.png")),
@@ -71,6 +247,9 @@ const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
 /// 「获取坐标方式一」里那个准心图标（按下拖到目标区域松手即可取坐标）。
 /// 素材是 src/assets/aim.svg，用 gpui 的 img() 按资源路径渲染。
 const AIM_ICON: &str = "icons/aim.svg";
+
+/// 设置页里那个跳发布页的 Gitee 图标（src/assets/gitee.png）。
+const GITEE_ICON: &str = "icons/gitee.png";
 
 /// 配置文件格式版本：以后结构变了可以按版本兼容。
 /// 1 → 2：操作列表从一份变成多方案（v1 的老配置读进来就是「方案一」）。
@@ -98,6 +277,9 @@ struct ConfigFile {
     opt_two: OptTwoConfig,
     #[serde(default)]
     hotkeys: HotkeyConfig,
+    /// 自动检测更新的方式（设置页里选的）。
+    #[serde(default)]
+    update_check_mode: UpdateCheckMode,
     /// 所有方案（方案一…方案五）。
     #[serde(default)]
     schemes: Vec<SchemeConfig>,
@@ -618,10 +800,13 @@ impl AppAssets {
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        if path == AIM_ICON {
-            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
-                "assets/aim.svg"
-            ))));
+        // 程序自己的小图标（准心、Gitee）先查，其余交给组件库的资源包。
+        let icons: [(&str, &'static [u8]); 2] = [
+            (AIM_ICON, include_bytes!("assets/aim.svg")),
+            (GITEE_ICON, include_bytes!("assets/gitee.png")),
+        ];
+        if let Some((_, bytes)) = icons.iter().find(|(resource, _)| *resource == path) {
+            return Ok(Some(std::borrow::Cow::Borrowed(*bytes)));
         }
         if let Some((_, bytes)) = PAYMENT_IMAGES
             .iter()
@@ -720,6 +905,13 @@ enum HotkeyEvent {
     SavePicked(Result<Option<PathBuf>, String>),
     /// 读取对话框选好的路径：Ok(None) 是用户取消
     LoadPicked(Result<Option<PathBuf>, String>),
+    /// 更新检测的结果；manual 表示是用户点「检测更新」触发的
+    UpdateChecked {
+        manual: bool,
+        result: Result<ReleaseInfo, String>,
+    },
+    /// 程序刚起来，按设置决定要不要自动检测更新
+    CheckUpdateOnStart,
     /// 录制中捕捉到的一次操作。`delay` 是它距离上一个操作过了多少毫秒。
     RecordedInput {
         opt_cate: OptCate,
@@ -791,6 +983,12 @@ pub struct IClick {
     data_table: Entity<TableState<MyTableDelegate>>,
     /// 读取/保存出错时的那行红字（显示在读取/保存按钮下面）；None 表示没出错。
     config_error: Option<SharedString>,
+    /// 自动检测更新的方式（设置页里选）。
+    update_check_mode: UpdateCheckMode,
+    /// 设置页里那行状态字（正在检测 / 已是最新 / 检测失败）。
+    update_status: Option<SharedString>,
+    /// 发现新版本时记下 tag 和下载地址，用它弹窗提示。
+    update_prompt: Option<(String, String)>,
 }
 
 fn subscribe_select_all(input: &Entity<InputState>, cx: &mut App) -> Subscription {
@@ -2242,17 +2440,20 @@ impl IClick {
                             &mut random_seed,
                         );
                         // GUI 没有控制台，随机延迟取到的值写到程序目录的日志里，方便核对。
-                        if random_delay
-                            && let Some(log) = delay_log.as_mut()
-                        {
-                            let _ = writeln!(
-                                log,
+                        if random_delay {
+                            let text = format!(
                                 "第 {} 轮  第 {} 行  第 {} 次  随机延迟 {} ms",
                                 completed_loops + 1,
                                 row_ix + 1,
                                 exec_ix + 1,
                                 delay
                             );
+                            // 控制台（把顶部的 windows_subsystem 注释掉就能看到）
+                            println!("{text}");
+                            // 同时落一份到程序目录的日志里，免得控制台关了就没痕迹。
+                            if let Some(log) = delay_log.as_mut() {
+                                let _ = writeln!(log, "{text}");
+                            }
                         }
                         if delay > 0
                             && !sleep_until_stopped(
@@ -2424,6 +2625,11 @@ impl IClick {
 
     /// 打开“修改快捷键”弹窗，同时开始捕捉新按键。
     fn open_hotkey_modal(&mut self, action: HotkeyAction, cx: &mut Context<Self>) {
+        // 正在执行时不改快捷键：弹窗会进入「等新按键」状态，
+        // 那时候连 F8 都会被当成新绑定吃掉，就没法暂停了。
+        if self.is_running {
+            return;
+        }
         self.hotkey_modal = Some(HotkeyModal {
             action,
             draft: self.hotkey_label(action),
@@ -2485,6 +2691,11 @@ impl IClick {
 
     /// 开始/停止录制：录制期间监听线程把鼠标按键、滚轮和键盘按键都记成表格里的行。
     fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+        // 执行中不开始录制：一边跑一边录，会把程序自己注入的输入也记进表格。
+        // 停止录制不受影响（万一进来之前就在录）。
+        if self.is_running && !self.is_recording {
+            return;
+        }
         self.is_recording = !self.is_recording;
         self.record_flag.store(self.is_recording, Ordering::Release);
         cx.notify();
@@ -2558,6 +2769,7 @@ impl IClick {
                 click_count: text(&self.click_count_input),
             },
             hotkeys: HotkeyConfig::from(&*lock_hotkeys(&self.hotkeys)),
+            update_check_mode: self.update_check_mode,
             schemes,
             active_scheme,
             rows,
@@ -2621,6 +2833,7 @@ impl IClick {
 
         let hotkeys = HotkeySettings::from(config.hotkeys.clone());
         *lock_hotkeys(&self.hotkeys) = hotkeys;
+        self.update_check_mode = config.update_check_mode;
 
         self.data_table.update(cx, |table, cx| {
             let delegate = table.delegate_mut();
@@ -2845,6 +3058,227 @@ impl IClick {
                 ),
             )
             .into_any_element()
+    }
+
+    /// 设置页：目前只有「检测更新」相关的东西。
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut page = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .bg(rgb(0xf6f6f6))
+            .p(px(8.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .mb(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("更新检测"),
+                    )
+                    .child(
+                        // 标题旁边的 Gitee 按钮：点一下打开发布页
+                        div()
+                            .id("gitee_button")
+                            .ml(px(8.0))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.open_url(RELEASE_PAGE);
+                            }))
+                            .child(img(GITEE_ICON).w(px(18.0)).h(px(18.0))),
+                    ),
+            )
+            .child(
+                div()
+                    .mb(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "当前版本 v{APP_VERSION}　与仓库里的 version.json 比对"
+                    )),
+            )
+            .child(
+                div()
+                    .mb(px(10.0))
+                    .child(
+                        RadioGroup::vertical("update_check_mode")
+                            .text_size(px(12.0))
+                            .children(UpdateCheckMode::ALL.map(|mode| {
+                                Radio::new(mode.label())
+                                    .label(mode.label())
+                                    .text_size(px(12.0))
+                            }))
+                            .selected_index(Some(self.update_check_mode.index()))
+                            .on_click(cx.listener(|this, index, _, cx| {
+                                this.update_check_mode = UpdateCheckMode::from_index(*index);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        Button::new("check_update_btn")
+                            .label("检测更新")
+                            .small()
+                            .text_size(px(12.0))
+                            .mr(px(10.0))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_update(true, cx);
+                            })),
+                    )
+                    .child(
+                        // 状态字：检测中 / 已是最新 / 失败原因
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(if self
+                                .update_status
+                                .as_ref()
+                                .is_some_and(|text| text.contains("失败"))
+                            {
+                                // 转成和主题色同类型（Hsla），否则 if/else 两边类型不一致
+                                rgba(0xd03030ff).into()
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(self.update_status.clone().unwrap_or_default()),
+                    ),
+            );
+
+        page.into_any_element()
+    }
+
+    /// 发现新版本时的弹窗：告诉用户有新版，可以直接跳去下载。
+    fn render_update_modal(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (tag, url) = self.update_prompt.clone()?;
+        let open_url = url.clone();
+        Some(
+            div()
+                .id("update_modal_backdrop")
+                .occlude()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(cx.theme().overlay)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(320.0))
+                        .p(px(14.0))
+                        .rounded(px(6.0))
+                        .border(px(1.0))
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .mb(px(8.0))
+                                .child("发现新版本"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .mb(px(4.0))
+                                .child(format!("新版本：{tag}")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(cx.theme().muted_foreground)
+                                .mb(px(12.0))
+                                .child(format!("当前版本：v{APP_VERSION}")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    Button::new("update_later")
+                                        .label("以后再说")
+                                        .small()
+                                        .text_size(px(12.0))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.update_prompt = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("update_go")
+                                        .label("前往下载")
+                                        .small()
+                                        .text_size(px(12.0))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.open_url(&open_url);
+                                            this.update_prompt = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 检测更新返回了：更新设置页的状态字，有新版本就弹窗。
+    fn apply_update_result(
+        &mut self,
+        manual: bool,
+        result: Result<ReleaseInfo, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(info) => {
+                if version_is_newer(&info.tag, APP_VERSION) {
+                    self.update_status = Some(format!("发现新版本 {}（当前 v{APP_VERSION}）", info.tag).into());
+                    self.update_prompt = Some((info.tag.clone(), info.download_url.clone()));
+                } else if manual {
+                    self.update_status = Some(format!("已是最新版本 v{APP_VERSION}").into());
+                } else {
+                    // 自动检测且没有新版：不打扰用户，状态字也不用留
+                    self.update_status = None;
+                }
+            }
+            Err(error) => {
+                // 自动检测失败就静默，别启动就弹一堆错
+                self.update_status = if manual {
+                    Some(format!("检测失败：{error}").into())
+                } else {
+                    None
+                };
+            }
+        }
+        cx.notify();
+    }
+
+    /// 检测更新：网络请求放后台线程，结果通过事件送回界面。
+    fn check_update(&mut self, manual: bool, cx: &mut Context<Self>) {
+        self.update_status = Some(if manual {
+            "正在检测…".into()
+        } else {
+            "正在后台检测更新…".into()
+        });
+        let sender = self.execution_event_tx.clone();
+        std::thread::spawn(move || {
+            let result = fetch_latest_release();
+            let _ = sender.try_send(HotkeyEvent::UpdateChecked { manual, result });
+        });
+        cx.notify();
     }
 
     /// 关于页：整页水平居中，自上而下是标题、下载地址、收款码，然后是功能、快捷键和用法。
@@ -4065,6 +4499,11 @@ impl Render for IClick {
                         								.items_center()
                                                        .cursor(CursorStyle::PointingHand)
                                                     .id("front")
+														  .tooltip(|window, cx| {
+                                                              Tooltip::new("使用SendInput发送前台事件，会占用键盘和鼠标")
+                                                                  .text_size(px(12.0))
+                                                                  .build(window, cx)
+                                                          })
 														  .on_click({
                                                                 let view = cx.entity().clone();
                                                                 move |_, _window, cx| {
@@ -4221,6 +4660,11 @@ impl Render for IClick {
 														.items_center()
                                                        .cursor(CursorStyle::PointingHand)
 														.id("fuzzy")
+														.tooltip(|window, cx| {
+                                                            Tooltip::new("以该操作坐标为中心，模糊范围内随机点击")
+                                                                .text_size(px(12.0))
+                                                                .build(window, cx)
+                                                        })
 														.on_click({
                                                                 let view = cx.entity().clone();
                                                                 move |_, _window, cx| {
@@ -4278,6 +4722,11 @@ impl Render for IClick {
                                                             .items_center()
                                                             .cursor(CursorStyle::PointingHand)
                                                             .id("random_delay")
+                                                            .tooltip(|window, cx| {
+                                                                Tooltip::new("当开启时，表格内的延迟将失效，每次操作会有随机的延迟")
+                                                                    .text_size(px(12.0))
+                                                                    .build(window, cx)
+                                                            })
                                                             .on_click(cx.listener(|this, _, _, cx| {
                                                                 this.random_delay = !this.random_delay;
                                                                 cx.notify();
@@ -4355,6 +4804,12 @@ impl Render for IClick {
                                                             .child(
                                                                 div()
                                                                     .mr(px(10.0))
+                                                                    .id("opt_gap_tooltip")
+                                                                    .tooltip(|window, cx| {
+                                                                        Tooltip::new("每单个操作需要等待多长时间才会执行")
+                                                                            .text_size(px(12.0))
+                                                                            .build(window, cx)
+                                                                    })
                                                                     .child("操作间隔："),
                                                             )
                                                             .child(div().w(px(80.0)).on_mouse_down(MouseButton::Left, mark_input_press).child(
@@ -4370,6 +4825,12 @@ impl Render for IClick {
                                                                     .mr(px(10.0))
                                                                     .flex()
                                                                     .items_center()
+                                                                    .id("loop_gap_tooltip")
+                                                                    .tooltip(|window, cx| {
+                                                                        Tooltip::new("每一轮表格循环之间的时间间隔")
+                                                                            .text_size(px(12.0))
+                                                                            .build(window, cx)
+                                                                    })
                                                                     .child("循环间隔："),
                                                             )
                                                             .child(
@@ -4591,10 +5052,13 @@ impl Render for IClick {
                 self.render_opt_two(cx).into_any_element()
             } else if self.active_tab == 2 {
                 self.render_about(cx)
+            } else if self.active_tab == 3 {
+                self.render_settings(cx)
             } else {
                 div().into_any_element()
             })
             .children(hotkey_modal_layer)
+            .children(self.render_update_modal(cx))
     }
 }
 use regex::Regex;
@@ -4619,7 +5083,7 @@ fn main() {
                             },
                         })),
                         titlebar: Some(TitlebarOptions {
-                            title: Some("iClick-gpui v1.1.0 By：吾爱破解：xarzhi".into()),
+                            title: Some("iClick-gpui v1.2.0 By：吾爱破解：xarzhi".into()),
                             ..Default::default()
                         }),
                         is_resizable: false,
@@ -4723,7 +5187,11 @@ fn main() {
                                 "操作一".to_string(),
                                 "操作二".to_string(),
                                 "关于".to_string(),
+                                "设置".to_string(),
                             ],
+                            update_check_mode: UpdateCheckMode::default(),
+                            update_status: None,
+                            update_prompt: None,
                             loop_count_input,
                             fuzzy_round_input,
                             random_delay: false,
@@ -4982,6 +5450,15 @@ fn main() {
                                         return;
                                     }
 
+                                    // 操作一正在执行时，除了「开始/暂停」其它快捷键一律不响应：
+                                    // 执行中手快按到 F9/F10/F6/F7 很容易造成误操作
+                                    //（中途开始录制、往表格里插行等）。
+                                    // F8 在上面已经处理过了，所以暂停/停止始终可用；
+                                    // 往输入框里打字（上面那条分支）也不受影响。
+                                    if listener_execution_flag.load(Ordering::Acquire) {
+                                        return;
+                                    }
+
                                     // 录制中：按下的键记成一行「按下 xxx」，包括 CTRL/SHIFT 这些
                                     // 修饰键自己（它们的弹起会另记一行，这样按住的过程能还原）。
                                     if listener_record_flag.load(Ordering::Acquire) {
@@ -5139,6 +5616,28 @@ fn main() {
                                                 Ok(None) => {}
                                                 Err(error) => view.set_config_error(error, cx),
                                             },
+                                            HotkeyEvent::UpdateChecked { manual, result } => {
+                                                view.apply_update_result(manual, result, cx);
+                                            }
+                                            HotkeyEvent::CheckUpdateOnStart => {
+                                                // 按设置决定要不要自动检测：
+                                                //   每次启动 → 每次都查
+                                                //   每天首次 → 上次查的日期不是今天就查
+                                                //   不自动检测 → 不查（还能手动点按钮）
+                                                let today = today_text();
+                                                let should_check = match view.update_check_mode {
+                                                    UpdateCheckMode::EveryStart => true,
+                                                    UpdateCheckMode::DailyFirst => {
+                                                        read_last_check_date().as_deref()
+                                                            != Some(today.as_str())
+                                                    }
+                                                    UpdateCheckMode::Never => false,
+                                                };
+                                                if should_check {
+                                                    write_last_check_date(&today);
+                                                    view.check_update(false, cx);
+                                                }
+                                            }
                                             HotkeyEvent::RecordedInput {
                                                 opt_cate,
                                                 opt_type,
@@ -5266,6 +5765,8 @@ fn main() {
                         if let Some(path) = startup_config {
                             let _ = startup_config_tx.try_send(HotkeyEvent::LoadConfig(path));
                         }
+                        // 配置读完之后再决定要不要自动检测更新（这样用的是配置里的设置）。
+                        let _ = startup_config_tx.try_send(HotkeyEvent::CheckUpdateOnStart);
 
                         cx.new(|cx| Root::new(view, window, cx))
                     },
@@ -5290,13 +5791,15 @@ mod double_click_tests {
         Instant, KeyAction, LEFT_DOUBLE_CLICK_LABEL, LPARAM, MAX_SCHEMES, MOUSE_MOVE_LABEL,
         MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
         OptCate, OptOneConfig, OptTwoConfig, RowConfig, SchemeConfig, SendMessageW, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WPARAM, class_accepts_double_click, config_file_stem, config_save_path,
+        WM_LBUTTONUP, WPARAM, UpdateCheckMode, class_accepts_double_click, config_file_stem,
+        config_save_path,
         double_click_gap, double_click_time_ms, first_free_scheme_name, fuzzy_point,
         hotkey_key_label, hotkey_keystroke, is_double_click, is_left_double_click, keeps_clicking,
-        keyboard_row_label, operation_delay, parse_config, plain_key_label, random_delay_between,
-        random_seed, recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, schemes_of,
+        keyboard_row_label, operation_delay, parse_config, parse_version, plain_key_label,
+        random_delay_between, random_seed, recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, schemes_of,
         send_message_mouse, should_record_move, sleep_until_stopped, split_key_action,
-        split_keyboard_combo, take_recorded_delay, waits_between_loops, write_config_file,
+        split_keyboard_combo, take_recorded_delay, version_is_newer, waits_between_loops,
+        write_config_file,
     };
     use rdev::{Button as RdevButton, Key as RdevKey};
     use std::sync::Arc;
@@ -5759,6 +6262,7 @@ mod double_click_tests {
                 click_gap: "30".to_string(),
                 click_count: "9".to_string(),
             },
+            update_check_mode: UpdateCheckMode::default(),
             hotkeys: HotkeyConfig {
                 record: "F11".to_string(),
                 toggle_run: "CTRL+F8".to_string(),
@@ -5897,6 +6401,7 @@ mod double_click_tests {
                 click_count: "6".to_string(),
             },
             hotkeys: HotkeyConfig::default(),
+            update_check_mode: UpdateCheckMode::default(),
             schemes: Vec::new(),
             active_scheme: 0,
             rows: vec![RowConfig {
@@ -5966,6 +6471,7 @@ mod double_click_tests {
             opt_one: OptOneConfig::default(),
             opt_two: OptTwoConfig::default(),
             hotkeys: HotkeyConfig::default(),
+            update_check_mode: UpdateCheckMode::default(),
             schemes: vec![
                 scheme("方案一", 1),
                 scheme("方案二", 2),
@@ -6010,6 +6516,7 @@ mod double_click_tests {
             opt_one: OptOneConfig::default(),
             opt_two: OptTwoConfig::default(),
             hotkeys: HotkeyConfig::default(),
+            update_check_mode: UpdateCheckMode::default(),
             schemes: (0..MAX_SCHEMES + 1)
                 .map(|_| SchemeConfig {
                     name: String::new(),
@@ -6074,6 +6581,55 @@ mod double_click_tests {
         assert!(
             values.iter().any(|value| *value != values[0]),
             "每次操作都应重新随机：{values:?}"
+        );
+    }
+
+    /// 版本号解析和比较：发布页的 tag 比当前新才算有新版本。
+    #[test]
+    fn version_comparison_picks_up_newer_releases() {
+        assert_eq!(parse_version("v1.2.0"), Some((1, 2, 0)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("V2.0"), Some((2, 0, 0)));
+        assert_eq!(parse_version("乱写的"), None);
+
+        assert!(version_is_newer("v1.2.1", "1.2.0"));
+        assert!(version_is_newer("v1.10.0", "1.9.9"), "数字比大小，不是字符串比");
+        assert!(version_is_newer("v2.0.0", "1.99.99"));
+        assert!(!version_is_newer("v1.2.0", "1.2.0"), "同版本不算新");
+        assert!(!version_is_newer("v1.1.9", "1.2.0"), "旧版本不算新");
+        assert!(!version_is_newer("乱七八糟", "1.2.0"), "认不出来就不提示");
+    }
+
+    /// 更新检测方式：存进配置、读回来还是那个；设置页下标来回也对得上。
+    #[test]
+    fn update_check_mode_survives_the_config() {
+        for mode in UpdateCheckMode::ALL {
+            assert_eq!(UpdateCheckMode::from_index(mode.index()), mode);
+        }
+        assert_eq!(UpdateCheckMode::default(), UpdateCheckMode::DailyFirst);
+
+        let mut config = ConfigFile {
+            version: CONFIG_VERSION,
+            saved_at: String::new(),
+            opt_one: OptOneConfig::default(),
+            opt_two: OptTwoConfig::default(),
+            hotkeys: HotkeyConfig::default(),
+            update_check_mode: UpdateCheckMode::EveryStart,
+            schemes: Vec::new(),
+            active_scheme: 0,
+            rows: Vec::new(),
+        };
+        let json = serde_json::to_string_pretty(&config).expect("能序列化");
+        let restored = parse_config(&json).expect("能读回来");
+        assert_eq!(restored.update_check_mode, UpdateCheckMode::EveryStart);
+
+        // 老配置没有这个字段 → 用默认值（每天首次）
+        config.update_check_mode = UpdateCheckMode::Never;
+        let old: ConfigFile = parse_config(r#"{"version":2}"#).expect("老配置能读");
+        assert_eq!(old.update_check_mode, UpdateCheckMode::DailyFirst);
+        assert_eq!(
+            serde_json::to_string(&UpdateCheckMode::Never).unwrap(),
+            "\"Never\""
         );
     }
 
