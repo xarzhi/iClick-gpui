@@ -64,8 +64,8 @@ const MK_MBUTTON: usize = 0x0010;
 /// 关于页里的下载地址。
 const DOWNLOAD_URL: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
 
-/// 关于页里的作者主页。
-const AUTHOR_URL: &str = "https://www.52pojie.cn/home.php?mod=space&uid=2283786";
+/// 关于页底部的项目地址（点一下打开 GitHub 仓库）。
+const PROJECT_URL: &str = "https://github.com/xarzhi/iClick-gpui";
 
 /// 发布页、以及查最新版本的地址（仓库根目录的 version.json，内容形如 {"version":"v1.2.0"}）。
 const RELEASE_PAGE: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
@@ -225,12 +225,6 @@ fn fetch_latest_release() -> Result<ReleaseInfo, String> {
         })
     }
 }
-
-/// 关于页里的两张收款码：资源路径 + include_bytes! 进来的图。
-const PAYMENT_IMAGES: [(&str, &[u8]); 2] = [
-    ("payment/wechat.png", include_bytes!("assets/wechat.png")),
-    ("payment/alipay.png", include_bytes!("assets/zhi-pay.png")),
-];
 
 /// 「获取坐标方式一」里那个准心图标（按下拖到目标区域松手即可取坐标）。
 /// 素材是 src/assets/aim.svg，用 gpui 的 img() 按资源路径渲染。
@@ -794,12 +788,6 @@ impl AssetSource for AppAssets {
             (GITEE_ICON, include_bytes!("assets/gitee.png")),
         ];
         if let Some((_, bytes)) = icons.iter().find(|(resource, _)| *resource == path) {
-            return Ok(Some(std::borrow::Cow::Borrowed(*bytes)));
-        }
-        if let Some((_, bytes)) = PAYMENT_IMAGES
-            .iter()
-            .find(|(resource, _)| *resource == path)
-        {
             return Ok(Some(std::borrow::Cow::Borrowed(*bytes)));
         }
         self.components.load(path)
@@ -3365,29 +3353,6 @@ impl IClick {
                             }))
                             .child(DOWNLOAD_URL),
                     ),
-            )
-            .child(
-                div()
-                    .w(text_width)
-                    .flex_shrink_0()
-                    .whitespace_normal()
-                    .text_center()
-                    .mb(px(8.0))
-                    .child("如果您觉得本软件对您有帮助，可以把钱交给我保管"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .justify_center()
-                    .gap(px(12.0))
-                    .mb(px(6.0))
-                    .children(PAYMENT_IMAGES.iter().map(|(resource, _)| {
-                        img(*resource)
-                            .w(px(168.0))
-                            .rounded(px(6.0))
-                            .into_any_element()
-                    })),
             );
 
         column = column.child(heading("功能介绍"));
@@ -3407,24 +3372,24 @@ impl IClick {
 
         column = column.child(heading("其它"));
         column = column.child(line("技术栈：Rust + GPUI + gpui-component"));
-        // 作者那一行里，「吾爱破解 xarzhi」是可以点的超链接。
+        // 底部这一行改成了项目地址：点一下直接打开 GitHub 仓库。
         column = column.child(
             div()
                 .flex()
                 .justify_center()
                 .items_center()
                 .mb(px(6.0))
-                .child("作者：")
+                .child("项目地址：")
                 .child(
                     div()
-                        .id("author_link")
+                        .id("project_link")
                         .cursor(CursorStyle::PointingHand)
                         .text_color(rgb(0x1f44fa))
                         .text_decoration_1()
                         .on_click(cx.listener(|_, _, _, cx| {
-                            cx.open_url(AUTHOR_URL);
+                            cx.open_url(PROJECT_URL);
                         }))
-                        .child("吾爱破解 xarzhi"),
+                        .child(PROJECT_URL),
                 ),
         );
 
@@ -5072,9 +5037,8 @@ fn main() {
                         })),
                         titlebar: Some(TitlebarOptions {
                             // 版本号跟着 Cargo.toml 走，不要在这里写死
-                            title: Some(
-                                format!("iClick-gpui v{APP_VERSION} By：吾爱破解：xarzhi").into(),
-                            ),
+                            // 标题栏只留程序名 + 版本号，不再带作者署名。
+                            title: Some(format!("iClick-gpui v{APP_VERSION}").into()),
                             ..Default::default()
                         }),
                         is_resizable: false,
