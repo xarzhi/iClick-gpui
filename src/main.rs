@@ -61,16 +61,19 @@ const MK_LBUTTON: usize = 0x0001;
 const MK_RBUTTON: usize = 0x0002;
 const MK_MBUTTON: usize = 0x0010;
 
-/// 关于页里的下载地址。
-const DOWNLOAD_URL: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
+/// 发布页：设置页那个小图标、更新弹窗的「前往下载」、关于页的下载地址，全都跳这里。
+const RELEASE_PAGE: &str = "https://github.com/xarzhi/iClick-gpui/releases";
+
+/// 关于页里的下载地址，和发布页是同一个地址。
+const DOWNLOAD_URL: &str = RELEASE_PAGE;
 
 /// 关于页底部的项目地址（点一下打开 GitHub 仓库）。
 const PROJECT_URL: &str = "https://github.com/xarzhi/iClick-gpui";
 
-/// 发布页、以及查最新版本的地址（仓库根目录的 version.json，内容形如 {"version":"v1.2.0"}）。
-const RELEASE_PAGE: &str = "https://gitee.com/xarzhi/i-click-gpui/releases";
-const VERSION_URL: &str =
-    "https://raw.giteeusercontent.com/xarzhi/i-click-gpui/raw/master/version.json";
+/// 查最新版本：直接问 GitHub「这个仓库最新一个 Release 是哪个」。
+/// 返回的 JSON 里 tag_name 就是版本号（形如 v1.5.0），html_url 是这次 Release 的页面。
+/// 注意：匿名访问每小时 60 次，够用；请求失败（限流返回 403）会走到下面的错误分支。
+const VERSION_URL: &str = "https://api.github.com/repos/xarzhi/iClick-gpui/releases/latest";
 
 /// 当前程序版本：直接取 Cargo.toml 里的 version，整个程序只有这一处版本号。
 /// 发版时只改 Cargo.toml —— 窗口标题、设置页、更新比对全都跟着走。
@@ -132,7 +135,7 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// version.json 里的版本是不是比当前的新。
+/// 上游给的版本号是不是比当前的新。
 fn version_is_newer(latest: &str, current: &str) -> bool {
     match (parse_version(latest), parse_version(current)) {
         (Some(latest), Some(current)) => latest > current,
@@ -147,7 +150,7 @@ struct ReleaseInfo {
     download_url: String,
 }
 
-/// 拉取仓库里的 version.json（Gitee 的 raw 地址）。走系统自带的 WinINet，不额外引依赖。
+/// 拉取 GitHub 上最新的 Release 信息。走系统自带的 WinINet，不额外引 HTTP 依赖。
 /// 注意：这是阻塞调用，要放在后台线程里跑。
 fn fetch_latest_release() -> Result<ReleaseInfo, String> {
     let agent: Vec<u16> = "iClick-gpui"
@@ -204,34 +207,44 @@ fn fetch_latest_release() -> Result<ReleaseInfo, String> {
         let _ = InternetCloseHandle(session);
 
         let text = String::from_utf8_lossy(&body);
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|_| "版本文件返回的内容看不懂，稍后再试".to_string())?;
-        // 现在的版本文件就一个字段：{"version": "v1.2.0"}。
-        // 顺手兼容一下老格式的 tag_name，读不到再说。
-        let tag = json
-            .get("version")
-            .or_else(|| json.get("tag_name"))
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if tag.is_empty() {
-            return Err("版本文件里没有版本号".to_string());
-        }
-        // 版本文件里没有下载直链，统一跳发布页（那里有 Release 和附件）。
-        Ok(ReleaseInfo {
-            tag,
-            download_url: RELEASE_PAGE.to_string(),
-        })
+        release_info_from_json(&text)
     }
+}
+
+/// 从 GitHub Releases API 的响应里取出「版本号」和「这次 Release 的页面地址」。
+/// 单独拆出来是为了能脱网测试：拿一段真的响应文本就能验解析。
+fn release_info_from_json(text: &str) -> Result<ReleaseInfo, String> {
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| "更新信息返回的内容看不懂，稍后再试".to_string())?;
+    // GitHub Releases API 的字段是 tag_name；老版本读的 version.json 里叫 version。
+    // 两个都认，谁先有就用谁。
+    let tag = json
+        .get("tag_name")
+        .or_else(|| json.get("version"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if tag.is_empty() {
+        return Err("更新信息里没有版本号".to_string());
+    }
+    // 顺手拿这次 Release 的页面地址；拿不到就退回发布页列表。
+    let download_url = json
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| RELEASE_PAGE.to_string());
+    Ok(ReleaseInfo { tag, download_url })
 }
 
 /// 「获取坐标方式一」里那个准心图标（按下拖到目标区域松手即可取坐标）。
 /// 素材是 src/assets/aim.svg，用 gpui 的 img() 按资源路径渲染。
 const AIM_ICON: &str = "icons/aim.svg";
 
-/// 设置页里那个跳发布页的 Gitee 图标（src/assets/gitee.png）。
-const GITEE_ICON: &str = "icons/gitee.png";
+/// 设置页里那个跳发布页的 GitHub 图标（src/assets/github.svg）。
+/// 单色矢量图，颜色由 Icon 的 text_color 决定。
+const GITHUB_ICON: &str = "icons/github.svg";
 
 /// 配置文件格式版本：以后结构变了可以按版本兼容。
 /// 1 → 2：操作列表从一份变成多方案（v1 的老配置读进来就是「方案一」）。
@@ -782,10 +795,10 @@ impl AppAssets {
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        // 程序自己的小图标（准心、Gitee）先查，其余交给组件库的资源包。
+        // 程序自己的小图标（准心、GitHub）先查，其余交给组件库的资源包。
         let icons: [(&str, &'static [u8]); 2] = [
             (AIM_ICON, include_bytes!("assets/aim.svg")),
-            (GITEE_ICON, include_bytes!("assets/gitee.png")),
+            (GITHUB_ICON, include_bytes!("assets/github.svg")),
         ];
         if let Some((_, bytes)) = icons.iter().find(|(resource, _)| *resource == path) {
             return Ok(Some(std::borrow::Cow::Borrowed(*bytes)));
@@ -3057,15 +3070,24 @@ impl IClick {
                             .child("更新检测"),
                     )
                     .child(
-                        // 标题旁边的 Gitee 按钮：点一下打开发布页
+                        // 标题旁边的按钮：点一下打开发布页。
+                        // 用组件库的 Icon + 单色矢量图（和准心那套一样），
+                        // 比 img() 光栅化的 PNG 在这个尺寸下更干净。
                         div()
-                            .id("gitee_button")
+                            .id("release_button")
                             .ml(px(8.0))
                             .cursor(CursorStyle::PointingHand)
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.open_url(RELEASE_PAGE);
                             }))
-                            .child(img(GITEE_ICON).w(px(18.0)).h(px(18.0))),
+                            .child(
+                                Icon::default()
+                                    .path(GITHUB_ICON)
+                                    .text_color(rgb(0x57606a))
+                                    .flex_none()
+                                    .w(px(18.0))
+                                    .h(px(18.0)),
+                            ),
                     ),
             )
             .child(
@@ -3074,7 +3096,7 @@ impl IClick {
                     .text_size(px(12.0))
                     .text_color(cx.theme().muted_foreground)
                     .child(format!(
-                        "当前版本 v{APP_VERSION}　与仓库里的 version.json 比对"
+                        "当前版本 v{APP_VERSION}　与 GitHub 上最新的 Release 比对"
                     )),
             )
             .child(
@@ -5731,16 +5753,17 @@ mod double_click_tests {
     // 这里不用 `use super::*`：crate 根上 `use gpui::*` 会带进来 gpui 自己的
     // `test` 同名宏，glob 一进本模块就会把内建的 #[test] 属性遮蔽掉。
     use super::{
-        CONFIG_VERSION, ConfigFile, Duration, HWND, HotkeyAction, HotkeyConfig, HotkeySettings,
-        Instant, KeyAction, LEFT_DOUBLE_CLICK_LABEL, LPARAM, MAX_SCHEMES, MOUSE_MOVE_LABEL,
-        MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData, MyTableDelegate, OperationGap,
-        OptCate, OptOneConfig, OptTwoConfig, RowConfig, SchemeConfig, SendMessageW, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WPARAM, UpdateCheckMode, class_accepts_double_click, config_file_stem,
-        config_save_path,
+        CONFIG_VERSION, ConfigFile, DOWNLOAD_URL, Duration, HWND, HotkeyAction, HotkeyConfig,
+        HotkeySettings, Instant, KeyAction, LEFT_DOUBLE_CLICK_LABEL, LPARAM, MAX_SCHEMES,
+        MOUSE_MOVE_LABEL, MOUSE_OPT_TYPE_LABELS, ModifierState, MouseOptType, MyData,
+        MyTableDelegate, OperationGap, OptCate, OptOneConfig, OptTwoConfig, RELEASE_PAGE, RowConfig,
+        SchemeConfig, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WPARAM, UpdateCheckMode,
+        class_accepts_double_click, config_file_stem, config_save_path,
         double_click_gap, double_click_time_ms, first_free_scheme_name, fuzzy_point,
         hotkey_key_label, hotkey_keystroke, is_double_click, is_left_double_click, keeps_clicking,
         keyboard_row_label, operation_delay, parse_config, parse_version, plain_key_label,
-        random_delay_between, random_seed, recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type, schemes_of,
+        random_delay_between, random_seed, recorded_double_opt_type, recorded_key_label, recorded_mouse_opt_type,
+        release_info_from_json, schemes_of,
         send_message_mouse, should_record_move, sleep_until_stopped, split_key_action,
         split_keyboard_combo, take_recorded_delay, version_is_newer, waits_between_loops,
         write_config_file,
@@ -6542,6 +6565,46 @@ mod double_click_tests {
         assert!(!version_is_newer("v1.2.0", "1.2.0"), "同版本不算新");
         assert!(!version_is_newer("v1.1.9", "1.2.0"), "旧版本不算新");
         assert!(!version_is_newer("乱七八糟", "1.2.0"), "认不出来就不提示");
+    }
+
+    /// 更新信息的解析：拿一段真的 GitHub Releases API 响应来验。
+    #[test]
+    fn release_info_comes_from_github_payload() {
+        // 真实响应里裁掉无关字段，留下用到的几个。
+        let payload = r#"{
+            "tag_name": "v1.5.0",
+            "name": "v1.5.0",
+            "html_url": "https://github.com/xarzhi/iClick-gpui/releases/tag/v1.5.0",
+            "assets": [{"name": "iClick-gpui.exe", "size": 9206784}]
+        }"#;
+        let info = release_info_from_json(payload).expect("能解析");
+        assert_eq!(info.tag, "v1.5.0");
+        assert_eq!(
+            info.download_url,
+            "https://github.com/xarzhi/iClick-gpui/releases/tag/v1.5.0",
+            "有 html_url 就跳到这一版的具体页面"
+        );
+        assert!(version_is_newer(&info.tag, "1.4.0"));
+
+        // 没有 html_url 就退回发布页列表。
+        let info = release_info_from_json(r#"{"tag_name":"v9.9.9"}"#).expect("能解析");
+        assert_eq!(info.download_url, RELEASE_PAGE);
+
+        // 老格式（原来 Gitee 上那个 version.json）也还能读。
+        let info = release_info_from_json(r#"{"version":"1.7.0"}"#).expect("能解析");
+        assert_eq!(info.tag, "1.7.0");
+
+        // 没有版本号、或者根本不是 JSON（比如 404 的 HTML 页面），都要报错，
+        // 不能当成「已是最新」蒙过去。
+        assert!(release_info_from_json(r#"{"name":"v1.0.0"}"#).is_err());
+        assert!(release_info_from_json("<html>404 not found</html>").is_err());
+
+        // 地址必须指向 GitHub，别又指回已经删掉的 Gitee 仓库。
+        assert!(
+            RELEASE_PAGE.starts_with("https://github.com/xarzhi/iClick-gpui"),
+            "发布页应当是 GitHub：{RELEASE_PAGE}"
+        );
+        assert_eq!(DOWNLOAD_URL, RELEASE_PAGE, "关于页的下载地址就是发布页");
     }
 
     /// 更新检测方式：只剩「每次启动」和「不自动检测」两项；
